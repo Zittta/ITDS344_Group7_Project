@@ -1,0 +1,15 @@
+# Environment variables (contains secrets – NEVER commit)
+.env
+
+# Airflow logs and data (large files, not source code)
+logs/
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
