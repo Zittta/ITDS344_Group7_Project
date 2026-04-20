@@ -18,7 +18,7 @@ x-airflow-common: &airflow-common
     SOCRATA_APP_TOKEN: ${SOCRATA_APP_TOKEN}
     CENSUS_API_KEY: ${CENSUS_API_KEY:-}
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/bronze-dag:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
@@ -96,7 +96,7 @@ services:
 
         # Fix ownership so scheduler/webserver (uid=50000) can write
         chown -R 50000:0 /opt/airflow/logs /opt/airflow/data
-        chmod -R 775 /opt/airflow/logs /opt/airflow/data
+        chmod -R 777 /opt/airflow/logs /opt/airflow/data
 
         # Initialise Airflow metadata DB
         airflow db migrate
@@ -116,6 +116,68 @@ services:
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
     user: "0:0"
+
+  # ─── Zookeeper (Kafka dependency) ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    restart: always
+
+  # ─── Kafka Broker ─────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  # ─── Kafka Producer (Socrata API → Kafka) ────────────────────────────────────
+  kafka-producer:
+    build:
+      context: ./bronze-streaming
+      dockerfile: Dockerfile
+    command: python kafka_producer.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      SOCRATA_APP_TOKEN: ${SOCRATA_APP_TOKEN}
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+    restart: always
+
+  # ─── Kafka Consumer — Bronze Archive (Kafka → data/bronze/) ──────────────────
+  kafka-consumer-bronze:
+    build:
+      context: ./bronze-streaming
+      dockerfile: Dockerfile
+    command: python consumer_bronze.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      BRONZE_DIR: /data/bronze
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+    restart: always
 
 volumes:
   postgres-db-volume:

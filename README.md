@@ -31,42 +31,58 @@ ITDS344 Data Engineering and Infrastructures (Semester 2/2568)
 
 ## Architecture
 
-### Medallion Architecture (Bronze → Silver → Gold)
+### Medallion Architecture (Bronze → Silver → Gold) + Kafka Streaming
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ BRONZE LAYER (Raw Data - Immutable)                             │
-├─────────────────────────────────────────────────────────────────┤
-│ • seattle_911/*.json          — Fire 911 calls (JSON from API)  │
-│ • spd_crime/*.json            — Crime reports (JSON from API)   │
-│ • seattle_population/*.csv    — ACS demographics (CSV)          │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ SILVER LAYER (Cleaned & Transformed)          [TODO: Phase 2]  │
-├─────────────────────────────────────────────────────────────────┤
-│ • Deduplication (drop_duplicates by primary key)                │
-│ • Data Quality checks (null/outlier/schema validation)          │
-│ • Standardize timestamps, geocodes, categories                  │
-│ • Merge incremental batches → single consolidated table         │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ GOLD LAYER (Data Warehouse)                   [TODO: Phase 2]  │
-├─────────────────────────────────────────────────────────────────┤
-│ • Fact Tables: fact_911_incidents, fact_crime_reports           │
-│ • Dimension Tables: dim_date, dim_location, dim_neighborhood    │
-│ • Star Schema optimized for analytics queries                   │
-│ • SCD Type 2 for slowly changing dimensions                     │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ DATA PRODUCT                                  [TODO: Phase 3]   │
-├─────────────────────────────────────────────────────────────────┤
-│ • Dashboard: Crime Trends, Hotspot Maps, Per-capita Rates       │
-│ • API: Real-time neighborhood safety scores                     │
-└─────────────────────────────────────────────────────────────────┘
+ Socrata API (911, Crime)              ACS CSV (Population)
+  updates every 5 min                   updates yearly
+        │                                     │
+        ▼                                     ▼
+┌───────────────────────┐       ┌─────────────────────────────────┐
+│  kafka_producer.py    │       │  ingestion_seattle_population   │
+│  (Docker service)     │       │  (Airflow DAG — @yearly)        │
+│  poll API → publish   │       │  copy CSV → Bronze              │
+└──────────┬────────────┘       └──────────────┬──────────────────┘
+           │ Kafka Topics                       │
+           │ bronze_911_calls                   │
+           │ bronze_crime_reports               │
+      ┌────┴────┐                               │
+      ▼         ▼                               │
+┌──────────┐  ┌──────────────┐                  │
+│ consumer │  │   consumer   │                  │
+│ _bronze  │  │   _silver    │◄─────────────────┘
+│ (Docker) │  │   (Docker)   │  (reads silver_population.csv)
+└──────────┘  └──────┬───────┘
+      │              │
+      ▼              ▼
+data/bronze/    data/silver/
+(immutable      silver_911_calls.csv
+ archive)       silver_crime_reports.csv      [TODO: Phase 2]
+                silver_population.csv
+                       │
+                       ▼
+        ┌──────────────────────────────────┐
+        │  gold_warehouse_dag              │
+        │  (Airflow DAG — @daily)  [TODO]  │
+        │  Hive External Tables            │
+        │  → dim_neighborhood, dim_date    │  [TODO: Phase 2]
+        │  → fact_crime, fact_911          │
+        │  → gold_per_capita_crime_rate    │
+        │  → gold_calls_vs_crime           │
+        └──────────────────────────────────┘
+                       │
+                       ▼
+        ┌──────────────────────────────────┐
+        │  DATA PRODUCT             [TODO] │
+        │  Dashboard / API          Phase 3│
+        └──────────────────────────────────┘
 ```
+
+**เครื่องมือ Big Data ที่ใช้:**
+| เครื่องมือ | Layer | บทบาท |
+|-----------|-------|-------|
+| **Apache Kafka** | Bronze | Streaming ingestion จาก Socrata API แบบ real-time |
+| **Apache Hive** | Gold | Star Schema + HiveQL analytics queries |
 
 ---
 
@@ -74,25 +90,34 @@ ITDS344 Data Engineering and Infrastructures (Semester 2/2568)
 
 ```
 .
-├── dags/                              # Airflow DAGs
-│   ├── ingestion_seattle_911_dag.py      # 911 calls ingestion (hourly)
-│   ├── ingestion_spd_crime_dag.py        # Crime reports ingestion (daily)
-│   └── ingestion_seattle_population_dag.py # ACS population (yearly)
+├── bronze-dag/                              # [Bronze] Airflow DAG (static data)
+│   └── ingestion_seattle_population_dag.py     # ACS Population (yearly, @yearly)
+│
+├── bronze-streaming/                         # [Bronze] Kafka Streaming (real-time data)
+│   ├── Dockerfile                              # Shared image สำหรับทุก streaming service
+│   ├── kafka_producer.py                       # Poll Socrata API → publish to Kafka
+│   └── consumer_bronze.py                      # Consume Kafka → archive to Bronze
+│
+├── silver/                                  # [Silver] Transform + Clean layer
+│   └── consumer_silver.py                      # Consume Kafka → transform → Silver [TODO]
+│
+├── gold/                                    # [Gold] Data Warehouse (Hive)
+│   └── TODO.py                                 # สิ่งที่ต้องทำสำหรับ Gold layer [TODO]
 │
 ├── data/
-│   ├── bronze/                        # Raw data (immutable)
-│   │   ├── seattle_911/YYYY/MM/DD/*.json
-│   │   ├── spd_crime/YYYY/MM/DD/*.json
-│   │   └── seattle_population/YYYY/*.csv
-│   ├── silver/                        # Cleaned data [TODO]
-│   ├── gold/                          # Data warehouse [TODO]
-│   ├── raw_csv/                       # Manually downloaded CSVs
-│   └── state/                         # Incremental tracking state files
+│   ├── bronze/                              # Raw data (immutable archive)
+│   │   ├── seattle_911/*.json                  # via bronze-streaming/consumer_bronze (flat)
+│   │   ├── spd_crime/*.json                    # via bronze-streaming/consumer_bronze (flat)
+│   │   └── seattle_population/*.csv            # via bronze-dag Airflow DAG
+│   ├── silver/                              # Cleaned data [TODO]
+│   ├── gold/                                # Data warehouse [TODO]
+│   ├── raw_csv/                             # Seed CSVs (tracked in git)
+│   └── state/                               # Watermark + seen-IDs state files
 │
-├── logs/                              # Airflow execution logs
-├── plugins/                           # Custom Airflow operators [if needed]
-├── docker-compose.yml                 # Airflow Docker setup
-├── .env                               # Environment variables (secrets)
+├── logs/                                    # Airflow execution logs
+├── plugins/                                 # Custom Airflow operators
+├── docker-compose.yml                       # All services (Airflow + Kafka + Hive)
+├── .env                                     # Environment variables (secrets)
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -137,92 +162,125 @@ AIRFLOW_UID=50000
 data/raw_csv/seattle_neighborhoods_acs.csv
 ```
 
-### 4. รัน Airflow
+### 4. รัน Services ทั้งหมด
 ```powershell
-# First-time setup
+# First-time setup (สร้าง Airflow DB + admin user)
 docker compose up airflow-init
 
-# Start services
+# Start all services
+# (Airflow, Kafka, Zookeeper, kafka-producer, kafka-consumer-bronze)
 docker compose up -d
 
-# เปิด Web UI
-start http://localhost:8080
-# (user: admin / pass: admin)
+# ตรวจสอบว่าทุก service รันอยู่
+docker compose ps
 ```
 
-### 5. Trigger DAGs
-ใน Airflow Web UI:
-1. Toggle เปิด DAG ทั้ง 3 (ปุ่มสีน้ำเงินทางซ้าย)
-2. คลิก ▶ (Trigger DAG) เพื่อรันทันที
+### 5. ตรวจสอบ Kafka Streaming
+```powershell
+# ดู logs ของ producer (ควรเห็น "Published X records")
+docker compose logs -f kafka-producer
+
+# ดู logs ของ bronze consumer (ควรเห็น "Wrote X records")
+docker compose logs -f kafka-consumer-bronze
+
+# ตรวจสอบไฟล์ที่ถูกสร้างใน Bronze
+Get-ChildItem data/bronze -Recurse -Filter *.json | Select-Object FullName, Length
+```
+
+### 6. Trigger Population DAG (manual)
+ใน Airflow Web UI (http://localhost:8080):
+1. Toggle เปิด DAG `ingestion_seattle_population`
+2. คลิก ▶ (Trigger DAG)
 
 หรือ CLI:
 ```powershell
-docker compose exec airflow-scheduler airflow dags trigger ingestion_seattle_911
-docker compose exec airflow-scheduler airflow dags trigger ingestion_spd_crime
 docker compose exec airflow-scheduler airflow dags trigger ingestion_seattle_population
 ```
 
 ---
 
-## DAGs Overview
+## Services Overview
 
-| DAG ID | Schedule | Description | Incremental Strategy |
-|--------|----------|-------------|---------------------|
-| `ingestion_seattle_911` | `@hourly` | ดึง 911 calls จาก Socrata API | Timestamp-based (`datetime > last_state`) |
-| `ingestion_spd_crime` | `@daily` | ดึง crime reports + pagination | Timestamp-based (`report_date_time > last_state`) |
-| `ingestion_seattle_population` | `@yearly` | Copy ACS CSV → Bronze | Full load (static data) |
+### Kafka Streaming Services (Docker — รันตลอด 24/7)
 
-**ทั้งหมดมี:**
-- ✅ Retry 3 ครั้ง (delay 5-10 นาที)
-- ✅ Idempotency check (ไม่ overwrite ไฟล์ซ้ำ)
-- ✅ State file tracking (เก็บ watermark timestamp)
-- ✅ Logging ครบทุก step
+| Service | รันแบบ | หน้าที่ | Poll Interval |
+|---------|--------|--------|---------------|
+| `kafka-producer` | continuous loop | Poll Socrata API → publish to Kafka | 911: 5 นาที / Crime: 1 ชม. |
+| `kafka-consumer-bronze` | continuous loop | Consume Kafka → archive JSON → Bronze | real-time |
+| `kafka-consumer-silver` | continuous loop | Consume Kafka → transform → Silver | real-time \[TODO\] |
+
+**Features:**
+- ✅ Watermark tracking — `data/state/kafka_911_state.json` / `kafka_crime_state.json`
+- ✅ Idempotency — seen-IDs state file (`seen_911_ids.json` / `seen_crime_ids.json`), manual Kafka offset commit หลัง write สำเร็จ
+- ✅ Data Quality — missing fields check, in-batch dedup, cross-run dedup
+- ✅ Auto-restart on crash (`restart: always`)
+- ✅ Offset pagination (50k records/page)
+
+### Airflow DAGs
+
+| DAG ID | Schedule | Description |
+|--------|----------|-------------|
+| `ingestion_seattle_population` | `@yearly` | Copy ACS CSV → Bronze → Silver |
+| `gold_warehouse_dag` | `@daily` | Hive Star Schema → Gold tables \[TODO\] |
+
+**Features:**
+- ✅ Retry 3 ครั้ง
+- ✅ Idempotency check
+- ✅ Logging ครบทุก task
 
 ---
 
 ## Technical Features Implemented
 
-### Data Ingestion (Phase 2) — ✅ เสร็จแล้ว
+### Bronze Layer — ✅ เสร็จแล้ว
 
 | Feature | Status | Implementation |
 |---------|--------|----------------|
-| **Incremental Load** | ✅ | State file tracking + WHERE clause filtering |
-| **Idempotency** | ✅ | `if os.path.exists(filepath): skip write` |
-| **Batch Processing** | ✅ | 50k records/page + offset pagination |
-| **Error Handling** | ✅ | `retries: 3`, `retry_delay: 5-10 min` |
-| **Logging** | ✅ | Python `logging` module ทุก task |
-| **Multiple Data Formats** | ✅ | JSON (API) + CSV (manual file) |
+| **Real-time Streaming** | ✅ | Kafka Producer polls Socrata API ทุก 5 นาที |
+| **Incremental Load** | ✅ | Watermark state files + `$where` timestamp filter |
+| **Idempotency** | ✅ | seen-IDs state file (incident_number / report_number) + manual Kafka offset commit |
+| **Data Quality** | ✅ | Missing fields check, in-batch dedup, cross-run dedup |
+| **Flat Storage** | ✅ | Bronze เก็บ JSON flat ใน `data/bronze/{topic}/` ไม่ partition ตามวันที่ |
+| **Batch Pagination** | ✅ | 50k records/page + offset loop |
+| **Error Handling** | ✅ | try/except + Docker `restart: always` |
+| **Logging** | ✅ | Python `logging` module ทุก service |
+| **Multiple Data Formats** | ✅ | JSON (API via Kafka) + CSV (static file via Airflow) |
+| **Big Data Tool: Kafka** | ✅ | Streaming backbone สำหรับ 911 + Crime data |
 
-### Data Transformation (Phase 2) — 🚧 In Progress
-- [ ] Deduplication & Merge
-- [ ] Data Quality checks (3+ rules)
-- [ ] Schema standardization
-- [ ] Silver layer consolidated tables
+### Silver Layer — 🚧 TODO
+- [x] `consumer_silver.py` — โครงสร้าง + TODO comments พร้อมแล้ว
+- [ ] Implement: deduplication (by report_number / incident_number)
+- [ ] Implement: null drop + schema validation
+- [ ] Implement: standardize timestamps + neighborhood names
+- [ ] Implement: append to Silver CSV
+- [ ] Add `kafka-consumer-silver` service ใน docker-compose.yml
 
-### Data Warehouse (Phase 2) — 📋 Planned
-- [ ] Star Schema (Fact + Dimension tables)
-- [ ] SCD Type 2 for dimensions
-- [ ] Business metrics aggregation
-- [ ] Gold layer analytics-ready tables
+### Gold Layer (Hive) — 📋 TODO
+- [ ] Hive External Tables ชี้ที่ Silver CSV
+- [ ] Star Schema: dim_neighborhood, dim_date
+- [ ] Fact Tables: fact_crime_reports, fact_911_incidents
+- [ ] Gold Aggregates: per-capita crime rate, calls vs crime
+- [ ] **Big Data Tool: Hive** — HiveQL analytics
 
-### Orchestration (Phase 3) — ✅ Automated
-- ✅ Airflow scheduler (cron-based)
-- ✅ Dependency management (task1 >> task2)
+### Orchestration — ✅ Running
+- ✅ Kafka streaming (continuous, Docker services)
+- ✅ Airflow scheduler (Population DAG @yearly)
+- [ ] Gold DAG (Airflow @daily) — TODO
 - [ ] Monitoring & alerting
-- [ ] E2E testing
 
 ---
 
 ## Current Status
 
 **Phase 2: Data Ingestion & Warehouse**  
-Progress: **35% Complete**
+Progress: **50% Complete**
 
-- [x] ✅ Bronze Layer — 3 data sources ingestion
-- [x] ✅ Incremental load mechanism
+- [x] ✅ Bronze Layer — Kafka streaming (911 + Crime) + Airflow (Population)
+- [x] ✅ Real-time ingestion via Kafka Producer/Consumer
+- [x] ✅ Incremental watermark tracking
 - [x] ✅ Logging & error handling
-- [ ] 🚧 Silver Layer — Transformation
-- [ ] 📋 Gold Layer — Data Warehouse
+- [ ] 🚧 Silver Layer — consumer_silver.py + transformations
+- [ ] 📋 Gold Layer — Hive Star Schema
 - [ ] 📋 Data Product — Dashboard/API
 
 **Bronze Layer Statistics:**
@@ -265,9 +323,9 @@ docker compose exec airflow-scheduler airflow users create \
 ## Team
 
 **Group 7**
-- [ชื่อสมาชิก 1]
-- [ชื่อสมาชิก 2]
-- [ชื่อสมาชิก 3]
+- Sitta Silakhett 6687054
+- Kittikhun Puangsuwan 6680759
+- Yanaphat Jumpaburee 6687112 
 
 ---
 

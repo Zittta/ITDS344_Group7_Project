@@ -1,15 +1,32 @@
 # Environment variables (contains secrets – NEVER commit)
 .env
 
-# Airflow logs and data (large files, not source code)
+# ── Airflow runtime ──────────────────────────────────────────────────────────
 logs/
+plugins/
+
+# ── Data layer (large / generated files) ────────────────────────────────────
+# Ignore all generated data...
 data/
 
-# Python
+# ...but always keep the raw CSV seed file used by the Population DAG
+!data/
+!data/raw_csv/
+!data/raw_csv/*.csv
+
+# ── Kafka / streaming state ──────────────────────────────────────────────────
+data/state/
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
 
-# OS
+# ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
