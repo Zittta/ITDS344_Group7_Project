@@ -1,0 +1,2 @@
+# Core HTTP client (used in all ingestion DAGs)
+requests==2.31.0
