@@ -1,32 +1,14 @@
-# TODO: Silver Layer — Kafka Consumer + Transform
-# ==========================================================
-# File: silver/consumer_silver.py
-# Purpose:
-#   Consume Kafka topics -> Transform -> Write Silver CSV
-#
-# Topics:
-#   bronze_911_calls
-#   bronze_crime_reports
-#
-# Output:
-#   /data/silver/silver_911_calls.csv
-#   /data/silver/silver_crime_reports.csv
-#
-# Run:
-#   python consumer_silver.py
-# ==========================================================
-
 import os
 import json
 import time
 import logging
+import re
 import pandas as pd
-
 from kafka import KafkaConsumer
 
-# ==========================================================
+# ==================================================
 # CONFIG
-# ==========================================================
+# ==================================================
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 
@@ -44,9 +26,9 @@ os.makedirs(LOG_DIR, exist_ok=True)
 SILVER_911 = f"{SILVER_DIR}/silver_911_calls.csv"
 SILVER_CRIME = f"{SILVER_DIR}/silver_crime_reports.csv"
 
-# ==========================================================
+# ==================================================
 # LOGGING
-# ==========================================================
+# ==================================================
 
 logging.basicConfig(
     filename=f"{LOG_DIR}/consumer_silver.log",
@@ -57,37 +39,51 @@ logging.basicConfig(
 print("Silver consumer started...")
 logging.info("Silver consumer started")
 
-# ==========================================================
-# HELPER FUNCTIONS
-# ==========================================================
+# ==================================================
+# COMMON CLEANERS
+# ==================================================
 
-def normalize_text(value):
-    """
-    lower + trim text
-    """
-    if pd.isna(value):
+BAD_VALUES = {"", "-", "--", "nan", "none", "null", "999", "unknown"}
+
+
+def clean_text(val, lower=True):
+    if pd.isna(val):
         return None
-    return str(value).strip().lower()
 
+    val = str(val).strip()
 
-def parse_datetime(value):
-    """
-    Convert datetime to standard format
-    YYYY-MM-DD HH:MM:SS
-    """
-    try:
-        dt = pd.to_datetime(value, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except:
+    if val.lower() in BAD_VALUES:
         return None
+
+    if re.fullmatch(r"\d+", val):
+        return None
+
+    return val.lower() if lower else val.upper()
+
+
+def clean_category(val):
+    if pd.isna(val):
+        return "UNKNOWN"
+
+    val = str(val).strip()
+
+    if val.lower() in BAD_VALUES:
+        return "UNKNOWN"
+
+    if re.fullmatch(r"\d+", val):
+        return "UNKNOWN"
+
+    return val.upper()
+
+
+def parse_datetime(val):
+    dt = pd.to_datetime(val, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def safe_read_csv(path):
-    """
-    Read csv safely
-    """
     if os.path.exists(path):
         try:
             return pd.read_csv(path)
@@ -95,103 +91,104 @@ def safe_read_csv(path):
             return pd.DataFrame()
     return pd.DataFrame()
 
-
-# ==========================================================
-# TRANSFORM FUNCTIONS
-# ==========================================================
+# ==================================================
+# TRANSFORM 911
+# ==================================================
 
 def transform_911(record):
-    """
-    Clean 911 record
-    """
-
     df = pd.DataFrame([record])
 
-    # required fields
-    if "incident_number" not in df.columns:
-        return pd.DataFrame()
+    required = ["incident_number", "neighborhood", "datetime"]
 
-    # standardize columns if missing
-    if "neighborhood" not in df.columns:
-        df["neighborhood"] = None
+    for col in required:
+        if col not in df.columns:
+            df[col] = None
 
-    if "datetime" not in df.columns:
-        df["datetime"] = None
-
-    # clean
-    df["neighborhood"] = df["neighborhood"].apply(normalize_text)
+    df["incident_number"] = df["incident_number"].astype(str).str.strip()
+    df["neighborhood"] = df["neighborhood"].apply(clean_text)
     df["datetime"] = df["datetime"].apply(parse_datetime)
 
-    # drop null
     df = df.dropna(subset=["incident_number", "neighborhood", "datetime"])
-
-    # dedup inside batch
     df = df.drop_duplicates(subset=["incident_number"])
 
     return df
 
+# ==================================================
+# TRANSFORM CRIME
+# ==================================================
 
 def transform_crime(record):
-    """
-    Clean crime record
-    """
-
     df = pd.DataFrame([record])
 
-    if "report_number" not in df.columns:
-        return pd.DataFrame()
+    required = [
+        "report_number",
+        "neighborhood",
+        "report_date_time",
+        "offense_sub_category"
+    ]
 
-    if "neighborhood" not in df.columns:
-        df["neighborhood"] = None
+    for col in required:
+        if col not in df.columns:
+            df[col] = None
 
-    if "report_date_time" not in df.columns:
-        df["report_date_time"] = None
-
-    if "offense_sub_category" not in df.columns:
-        df["offense_sub_category"] = "UNKNOWN"
-
-    # clean
-    df["neighborhood"] = df["neighborhood"].apply(normalize_text)
+    df["report_number"] = df["report_number"].astype(str).str.strip()
+    df["neighborhood"] = df["neighborhood"].apply(clean_text)
     df["report_date_time"] = df["report_date_time"].apply(parse_datetime)
+    df["offense_sub_category"] = df["offense_sub_category"].apply(clean_category)
 
-    df["offense_sub_category"] = df["offense_sub_category"].fillna("UNKNOWN")
+    df = df.dropna(subset=[
+        "report_number",
+        "neighborhood",
+        "report_date_time"
+    ])
 
-    # drop null
-    df = df.dropna(subset=["report_number", "neighborhood", "report_date_time"])
-
-    # dedup
     df = df.drop_duplicates(subset=["report_number"])
 
     return df
 
+# ==================================================
+# SAVE
+# ==================================================
 
-# ==========================================================
-# SAVE FUNCTIONS
-# ==========================================================
-
-def append_merge_csv(new_df, file_path, pk):
-    """
-    Merge old csv + new records + dedup
-    """
-
-    if new_df.empty:
+def save_merge(df_new, path, pk):
+    if df_new.empty:
         return
 
-    old_df = safe_read_csv(file_path)
+    df_old = safe_read_csv(path)
 
-    merged = pd.concat([old_df, new_df], ignore_index=True)
-
+    merged = pd.concat([df_old, df_new], ignore_index=True)
     merged = merged.drop_duplicates(subset=[pk], keep="last")
 
-    merged.to_csv(file_path, index=False)
+    merged.to_csv(path, index=False)
 
-    logging.info(f"Updated {file_path} rows={len(merged)}")
-    print(f"Updated {file_path} rows={len(merged)}")
+    print(f"Updated {path} rows={len(merged)}")
+    logging.info(f"Updated {path} rows={len(merged)}")
 
+# ==================================================
+# FLUSH
+# ==================================================
 
-# ==========================================================
-# KAFKA CONSUMER
-# ==========================================================
+buffer_911 = []
+buffer_crime = []
+
+def flush():
+    global buffer_911, buffer_crime
+
+    if buffer_911:
+        df = pd.concat(buffer_911, ignore_index=True)
+        df = df.drop_duplicates(subset=["incident_number"])
+        save_merge(df, SILVER_911, "incident_number")
+        buffer_911 = []
+
+    if buffer_crime:
+        df = pd.concat(buffer_crime, ignore_index=True)
+        df = df.drop_duplicates(subset=["report_number"])
+        save_merge(df, SILVER_CRIME, "report_number")
+        buffer_crime = []
+
+# ==================================================
+# KAFKA
+# ==================================================
 
 consumer = KafkaConsumer(
     *TOPICS,
@@ -202,79 +199,43 @@ consumer = KafkaConsumer(
     value_deserializer=lambda x: json.loads(x.decode("utf-8"))
 )
 
-# ==========================================================
+# ==================================================
 # MAIN LOOP
-# ==========================================================
-
-buffer_911 = []
-buffer_crime = []
+# ==================================================
 
 BATCH_SIZE = 100
-LAST_FLUSH = time.time()
-FLUSH_INTERVAL = 10   # seconds
-
-
-def flush_all():
-    global buffer_911, buffer_crime
-
-    # ---------- 911 ----------
-    if buffer_911:
-        df = pd.concat(buffer_911, ignore_index=True)
-        df = df.drop_duplicates(subset=["incident_number"])
-        append_merge_csv(df, SILVER_911, "incident_number")
-        buffer_911 = []
-
-    # ---------- Crime ----------
-    if buffer_crime:
-        df = pd.concat(buffer_crime, ignore_index=True)
-        df = df.drop_duplicates(subset=["report_number"])
-        append_merge_csv(df, SILVER_CRIME, "report_number")
-        buffer_crime = []
-
+FLUSH_INTERVAL = 10
+last_flush = time.time()
 
 try:
-    for message in consumer:
+    for msg in consumer:
 
-        topic = message.topic
-        data = message.value
+        topic = msg.topic
+        data = msg.value
 
         try:
-
-            # ==========================================
-            # 911 TOPIC
-            # ==========================================
             if topic == "bronze_911_calls":
-                clean_df = transform_911(data)
+                df = transform_911(data)
+                if not df.empty:
+                    buffer_911.append(df)
 
-                if not clean_df.empty:
-                    buffer_911.append(clean_df)
-
-            # ==========================================
-            # CRIME TOPIC
-            # ==========================================
             elif topic == "bronze_crime_reports":
-                clean_df = transform_crime(data)
+                df = transform_crime(data)
+                if not df.empty:
+                    buffer_crime.append(df)
 
-                if not clean_df.empty:
-                    buffer_crime.append(clean_df)
-
-            # ==========================================
-            # FLUSH CONDITION
-            # ==========================================
+            total = len(buffer_911) + len(buffer_crime)
             now = time.time()
 
-            total_rows = len(buffer_911) + len(buffer_crime)
-
-            if total_rows >= BATCH_SIZE or (now - LAST_FLUSH) >= FLUSH_INTERVAL:
-                flush_all()
-                LAST_FLUSH = now
+            if total >= BATCH_SIZE or (now - last_flush) >= FLUSH_INTERVAL:
+                flush()
+                last_flush = now
 
         except Exception as e:
-            logging.error(f"Transform error: {str(e)}")
+            logging.error(f"Transform Error: {e}")
 
 except KeyboardInterrupt:
-    print("Stopping consumer...")
-    flush_all()
+    flush()
 
 except Exception as e:
-    logging.error(f"Fatal error: {str(e)}")
+    logging.error(f"Fatal Error: {e}")
