@@ -1,32 +1,37 @@
-# Environment variables (contains secrets – NEVER commit)
+# ── Secrets (ห้าม commit เด็ดขาด) ──────────────────────────────────────────
 .env
+*.env
+.env.*
 
 # ── Airflow runtime ──────────────────────────────────────────────────────────
 logs/
 plugins/
 
-# ── Data layer (large / generated files) ────────────────────────────────────
-# Ignore all generated data...
-data/
-
-# ...but always keep the raw CSV seed file used by the Population DAG
-!data/
+# ── Data layer (large / generated — ถูก generate โดย DAGs) ─────────────────
+data/bronze/
+data/silver/
+data/gold/
+data/state/
+# เก็บ raw_csv/ ไว้ใน git (CSV ขนาดเล็ก, static, ต้องแชร์ให้ทีม)
 !data/raw_csv/
 !data/raw_csv/*.csv
 
-# ── Kafka / streaming state ──────────────────────────────────────────────────
-data/state/
+# ── Docker volumes / temp ────────────────────────────────────────────────────
+.docker/
 
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 *.egg-info/
 dist/
 build/
+.venv/
+venv/
 
-# ── OS ───────────────────────────────────────────────────────────────────────
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db

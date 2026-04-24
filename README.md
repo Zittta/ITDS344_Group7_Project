@@ -7,7 +7,285 @@ ITDS344 Data Engineering and Infrastructures (Semester 2/2568)
 
 ## Project Overview
 
-สร้างระบบ Data Engineering แบบครบวงจร (Bronze → Silver → Gold) สำหรับการวิเคราะห์ Public Safety ของเมือง Seattle โดยรวมข้อมูล 911 Calls, Crime Reports และ Demographics เข้าด้วยกัน เพื่อสร้าง Dashboard แสดงสถิติอาชญากรรมแบบ Real-time
+ระบบ Data Engineering แบบ Medallion Architecture (Bronze → Silver → Gold) สำหรับวิเคราะห์ Public Safety ของเมือง Seattle โดยรวมข้อมูล 911 Calls, Crime Reports และ ACS Demographics เข้าด้วยกัน
+
+**Business Goals:**
+- วิเคราะห์ Crime Trends และ Hotspots ตามย่านและช่วงเวลา
+- คำนวณอัตราอาชญากรรมต่อประชากร (per-capita crime rate)
+- เปรียบเทียบความถี่ 911 calls กับจำนวน crime reports
+- สนับสนุน data-driven decision making สำหรับการจัดสรรทรัพยากร
+
+---
+
+## Data Sources
+
+| # | Dataset | Source | Type | Records (ปัจจุบัน) |
+|---|---------|--------|------|-------------------|
+| 1 | Seattle Real-Time Fire 911 Calls | [data.seattle.gov](https://data.seattle.gov/Public-Safety/Seattle-Real-Time-Fire-911-Calls/kzjm-xkqj) | Socrata API | ~282,000 |
+| 2 | SPD Crime Data 2008-Present | [data.seattle.gov](https://data.seattle.gov/Public-Safety/SPD-Crime-Data-2008-Present/tazs-3rd5) | Socrata API | ~184,000 |
+| 3 | Seattle Neighborhoods ACS (2024) | `data/raw_csv/seattle_neighborhoods_acs.csv` | CSV | 87 neighborhoods |
+
+---
+
+## Architecture
+
+```
+Socrata API ──► Kafka Producer ──► [Kafka Topics]
+                                         │
+                    ┌────────────────────┴────────────────────┐
+                    ▼                                         ▼
+          kafka-consumer-bronze                     Airflow DAGs (batch)
+          (writes raw to MongoDB)                   bronze_api_ingest (5 min)
+                    │                               bronze_population (manual)
+                    ▼
+            MongoDB: bronze DB  ◄──────────────────────────────┘
+            ├── seattle_911
+            ├── spd_crime
+            └── seattle_population
+                    │
+                    ▼  silver_transform DAG (10 min)
+            MongoDB: silver DB
+            ├── silver_911_clean
+            ├── silver_crime_clean
+            └── silver_population_clean
+                    │
+                    ▼  gold_analytics DAG (30 min)
+            MongoDB: gold DB
+            ├── fact_crime_events, fact_911_calls
+            ├── dim_time, dim_location, dim_offense, dim_event_type, dim_demographics
+            └── agg_crime_by_neighborhood_month, agg_crime_by_offense_category,
+                agg_911_by_hour_day, agg_crime_per_capita
+```
+
+| Service | Port | ใช้สำหรับ |
+|---------|------|-----------|
+| Airflow UI | http://localhost:8080 | admin/admin |
+| Mongo Express | http://localhost:8081 | admin/admin |
+| MongoDB | localhost:27017 | direct connection |
+| Kafka | localhost:9092 | broker |
+
+---
+
+## Project Structure
+
+```
+ITDS344_Group7_Project/
+├── dags/
+│   ├── bronze_api_ingest_dag.py       # Bronze: 911 + Crime จาก Socrata API
+│   ├── bronze_population_dag.py       # Bronze: ACS CSV → MongoDB (manual trigger)
+│   ├── silver_transform_dag.py        # Silver: clean + type + DQ checks
+│   └── gold_analytics_dag.py          # Gold: Star Schema + Aggregations
+├── bronze-streaming/
+│   ├── kafka_producer.py              # Poll Socrata API → publish to Kafka
+│   ├── consumer_bronze.py             # Kafka consumer → MongoDB bronze
+│   └── Dockerfile
+├── data/
+│   └── raw_csv/
+│       └── seattle_neighborhoods_acs.csv  # ✅ tracked in git
+├── docker-compose.yml
+├── .env                               # ❌ NOT in git — ต้องสร้างเอง (ดูด้านล่าง)
+├── requirements.txt
+├── DATA_STRUCTURE.md                  # รายละเอียด schema ทุก collection + dashboard guide
+└── README.md
+```
+
+---
+
+## Quick Start (สำหรับ clone แล้วรันครั้งแรก)
+
+### Prerequisites
+- **Docker Desktop** (Windows/Mac) หรือ Docker Engine (Linux) — version 24+
+- RAM แนะนำ **≥ 8 GB** (Airflow + MongoDB + Kafka ใช้ ~4–5 GB)
+- ไม่ต้องติดตั้ง Python, MongoDB, Kafka เพราะทุกอย่างอยู่ใน Docker
+
+---
+
+### Step 1 — Clone & เข้า folder
+
+```powershell
+git clone <repository-url>
+cd ITDS344_Group7_Project
+```
+
+---
+
+### Step 2 — สร้าง `.env` file
+
+`.env` ไม่อยู่ใน git เพราะเก็บ secret — ต้องสร้างเอง:
+
+```powershell
+# Windows PowerShell
+Copy-Item .env.example .env   # ถ้ามี .env.example
+# หรือสร้างใหม่เลย
+```
+
+เนื้อหาของ `.env` (copy ไปวาง แล้วแก้ token):
+
+```ini
+# Socrata App Token — ดูวิธีสมัครด้านล่าง
+SOCRATA_APP_TOKEN=ใส่_token_ของคุณ
+
+# Airflow
+AIRFLOW_UID=50000
+AIRFLOW_PROJ_DIR=.
+
+# PostgreSQL (Airflow metadata DB)
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow
+POSTGRES_DB=airflow
+
+# Airflow Admin
+AIRFLOW_ADMIN_USERNAME=admin
+AIRFLOW_ADMIN_PASSWORD=admin
+AIRFLOW_ADMIN_EMAIL=admin@example.com
+
+# MongoDB
+MONGO_URI=mongodb://mongo:27017
+```
+
+**วิธีขอ Socrata App Token (ฟรี):**
+1. ไปที่ https://data.seattle.gov → Sign In
+2. My Profile → App Tokens → Create New App Token
+3. Copy token มาใส่ใน `.env`
+
+> ⚠️ ถ้าไม่มี token ก็ยังรันได้ แต่ Socrata จะ rate-limit ที่ ~100 req/hr
+
+---
+
+### Step 3 — ตรวจสอบ CSV มีอยู่แล้ว
+
+```powershell
+Test-Path data\raw_csv\seattle_neighborhoods_acs.csv
+# ควรได้ True — ไฟล์นี้ track ใน git อยู่แล้ว
+```
+
+---
+
+### Step 4 — รัน Docker
+
+```powershell
+# ครั้งแรก: build images + start ทุก service
+docker compose -f docker-compose.yml up --build -d
+
+# ดูว่าทุก container healthy ไหม (รอ ~2 นาที)
+docker ps
+
+# หรือดู log airflow-init (ควรจบด้วย exit 0)
+docker compose logs airflow-init
+```
+
+> **Linux users:** ถ้า Airflow volume permission error ให้รัน `echo "AIRFLOW_UID=$(id -u)" >> .env` ก่อน
+
+---
+
+### Step 5 — เปิด UI และ trigger DAGs
+
+เข้า **http://localhost:8080** (admin / admin)
+
+ควรเห็น 4 DAGs ทั้งหมด สถานะ **ON** (ไม่ต้อง toggle):
+
+| DAG | Schedule | Action |
+|-----|----------|--------|
+| `bronze_api_ingest` | ทุก 5 นาที | รันอัตโนมัติ ✅ |
+| `bronze_population_ingest` | Manual | **Trigger ด้วยมือ** ▶ |
+| `silver_transform` | ทุก 10 นาที | รันอัตโนมัติ ✅ |
+| `gold_analytics` | ทุก 30 นาที | รันอัตโนมัติ ✅ |
+
+**Trigger ตามลำดับนี้ครั้งแรก** (เพื่อให้ข้อมูลไหลเร็ว):
+
+```powershell
+# 1. Bronze API (รอ ~2 นาทีให้ดึงข้อมูลเสร็จ)
+docker exec itds344_group7_project-airflow-scheduler-1 `
+  airflow dags trigger bronze_api_ingest
+
+# 2. Bronze Population CSV
+docker exec itds344_group7_project-airflow-scheduler-1 `
+  airflow dags trigger bronze_population_ingest
+
+# 3. Silver (หลัง bronze เสร็จ ~2 นาที)
+docker exec itds344_group7_project-airflow-scheduler-1 `
+  airflow dags trigger silver_transform
+
+# 4. Gold (หลัง silver เสร็จ ~2 นาที)
+docker exec itds344_group7_project-airflow-scheduler-1 `
+  airflow dags trigger gold_analytics
+```
+
+---
+
+### Step 6 — ตรวจสอบข้อมูล
+
+เข้า **http://localhost:8081** (Mongo Express) แล้วดู database:
+
+| MongoDB DB | Collection | Expected Records |
+|------------|-----------|-----------------|
+| `bronze` | `seattle_911` | ~282,000 |
+| `bronze` | `spd_crime` | ~184,000 |
+| `bronze` | `seattle_population` | 87 |
+| `silver` | `silver_911_clean` | ~282,000 |
+| `silver` | `silver_crime_clean` | ~184,000 |
+| `gold` | `fact_crime_events` | ~184,000 |
+| `gold` | `fact_911_calls` | ~282,000 |
+
+หรือตรวจสอบผ่าน terminal:
+
+```powershell
+docker exec itds344_group7_project-mongo-1 mongosh --quiet --eval "
+  use('bronze');
+  print('911:', db.seattle_911.countDocuments());
+  print('crime:', db.spd_crime.countDocuments());
+  print('pop:', db.seattle_population.countDocuments());
+  use('silver');
+  print('silver_911:', db.silver_911_clean.countDocuments());
+  print('silver_crime:', db.silver_crime_clean.countDocuments());
+  use('gold');
+  print('fact_crime:', db.fact_crime_events.countDocuments());
+  print('fact_911:', db.fact_911_calls.countDocuments());
+"
+```
+
+---
+
+## Useful Commands
+
+```powershell
+# หยุดทุก service (เก็บ data ไว้)
+docker compose -f docker-compose.yml down
+
+# หยุดและลบ data ทั้งหมด (reset สมบูรณ์)
+docker compose -f docker-compose.yml down -v
+
+# ดู logs แบบ live
+docker compose logs -f airflow-scheduler
+docker compose logs -f kafka-producer
+docker compose logs -f kafka-consumer-bronze
+
+# รัน DAG task เดี่ยวๆ (debug)
+docker exec itds344_group7_project-airflow-scheduler-1 `
+  airflow tasks test silver_transform transform_911_to_silver 2026-04-24
+
+# เข้า MongoDB shell
+docker exec -it itds344_group7_project-mongo-1 mongosh
+```
+
+---
+
+## Troubleshooting
+
+| อาการ | สาเหตุ | วิธีแก้ |
+|-------|--------|--------|
+| DAG ไม่ขึ้นใน Airflow | DAG file มี syntax error | `docker compose logs airflow-scheduler` |
+| Silver ว่างทั้งที่ bronze มีข้อมูล | Bronze ยัง ingest ไม่เสร็จ | รอ 2 นาที แล้ว trigger silver อีกครั้ง |
+| `service "mongo" is not running` | รัน command ผิด directory | ต้องรัน `docker compose` จาก folder ที่มี `docker-compose.yml` |
+| Permission denied (Linux) | AIRFLOW_UID ไม่ตรง | `echo "AIRFLOW_UID=$(id -u)" >> .env` แล้ว `docker compose up -d` |
+| Port 8080 ถูกใช้อยู่ | มี service อื่น | แก้ `AIRFLOW_WEBSERVER_PORT` ใน `.env` |
+
+---
+
+## Data Schema & Dashboard Guide
+
+ดูรายละเอียด schema ทุก collection และคำแนะนำ Dashboard ได้ที่ [DATA_STRUCTURE.md](DATA_STRUCTURE.md)
+
 
 **Business Goals:**
 - วิเคราะห์ Crime Trends และ Hotspots ตามย่านและช่วงเวลา

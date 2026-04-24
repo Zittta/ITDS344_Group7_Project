@@ -7,18 +7,18 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
     AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
     # Extra packages installed at container start
-    _PIP_ADDITIONAL_REQUIREMENTS: 'requests==2.31.0'
+    _PIP_ADDITIONAL_REQUIREMENTS: 'requests==2.31.0 pymongo==4.6.1 kafka-python==2.0.2'
     # Project secrets (loaded from .env)
     SOCRATA_APP_TOKEN: ${SOCRATA_APP_TOKEN}
-    CENSUS_API_KEY: ${CENSUS_API_KEY:-}
+    MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/bronze-dag:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
@@ -26,8 +26,41 @@ x-airflow-common: &airflow-common
   depends_on: &airflow-common-depends-on
     postgres:
       condition: service_healthy
+    mongo:
+      condition: service_healthy
 
 services:
+  # ─── MongoDB — Bronze / Silver / Gold storage ─────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: always
+
+  # ─── Mongo Express — Web UI for MongoDB ──────────────────────────────────────
+  mongo-express:
+    image: mongo-express:1.0.2
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongo
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: always
+
   # ─── Metadata Database ────────────────────────────────────────────────────────
   postgres:
     image: postgres:13
@@ -86,17 +119,14 @@ services:
       - -c
       - |
         # Create Bronze layer directories and state folder
-        mkdir -p /opt/airflow/data/bronze/seattle_911 \
-                  /opt/airflow/data/bronze/spd_crime \
-                  /opt/airflow/data/bronze/seattle_population \
+        mkdir -p /opt/airflow/dags \
                   /opt/airflow/data/raw_csv \
-                  /opt/airflow/data/state \
                   /opt/airflow/logs \
                   /opt/airflow/plugins
 
         # Fix ownership so scheduler/webserver (uid=50000) can write
-        chown -R 50000:0 /opt/airflow/logs /opt/airflow/data
-        chmod -R 777 /opt/airflow/logs /opt/airflow/data
+        chown -R 50000:0 /opt/airflow/logs /opt/airflow/data /opt/airflow/dags
+        chmod -R 777 /opt/airflow/logs /opt/airflow/data /opt/airflow/dags
 
         # Initialise Airflow metadata DB
         airflow db migrate
@@ -163,7 +193,7 @@ services:
       - ${AIRFLOW_PROJ_DIR:-.}/data:/data
     restart: always
 
-  # ─── Kafka Consumer — Bronze Archive (Kafka → data/bronze/) ──────────────────
+  # ─── [STREAMING] Kafka Consumer — Kafka → MongoDB bronze ──────────────────────
   kafka-consumer-bronze:
     build:
       context: ./bronze-streaming
@@ -172,12 +202,13 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      mongo:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
-      BRONZE_DIR: /data/bronze
-    volumes:
-      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
     restart: always
 
 volumes:
   postgres-db-volume:
+  mongo-data:

@@ -7,7 +7,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     kafka-python-ng==2.2.3 \
     requests==2.31.0 \
-    pandas==2.2.2
+    pandas==2.2.2 \
+    pymongo==4.6.1
 
 # Copy all streaming scripts
 COPY kafka_producer.py .
