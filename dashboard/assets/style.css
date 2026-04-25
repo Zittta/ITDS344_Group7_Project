@@ -1,0 +1,430 @@
+/* ============================================================
+   Seattle Crime Intelligence — Dashboard Stylesheet
+   Theme: Warm Editorial Minimal
+   ITDS344 Group 7
+   NOTE: Google Fonts are loaded via inline <style>@import in dashboard.py
+         so they are available before first render. Do NOT add @import here.
+   ============================================================ */
+
+/* ── CSS Variables ─────────────────────────────────────────── */
+:root {
+    --bg:          #f5f0e8;
+    --surface:     #ede8de;
+    --surface-2:   #e4ddd1;
+    --border:      #d4cbbf;
+    --border-soft: #ddd5c9;
+
+    --ink:         #1c1814;
+    --ink-mid:     #4a4037;
+    --ink-faint:   #74695f;
+    --ink-ghost:   #968b7e;
+
+    --accent:      #b84c1e;
+    --accent-soft: rgba(184, 76, 30, 0.10);
+    --accent-mid:  rgba(184, 76, 30, 0.22);
+
+    --green:       #2d6a4f;
+    --green-soft:  rgba(45, 106, 79, 0.10);
+    --amber:       #b07d2b;
+    --amber-soft:  rgba(176, 125, 43, 0.10);
+    --slate:       #3b5268;
+    --slate-soft:  rgba(59, 82, 104, 0.10);
+
+    --radius-sm:   6px;
+    --radius-md:   12px;
+    --radius-lg:   18px;
+    --radius-xl:   24px;
+
+    --font-display: 'Playfair Display', Georgia, serif;
+    --font-mono:    'IBM Plex Mono', 'Courier New', monospace;
+    --font-body:    'Instrument Sans', 'Helvetica Neue', sans-serif;
+
+    --shadow-sm:   0 1px 3px rgba(28,24,20,0.06), 0 1px 2px rgba(28,24,20,0.04);
+    --shadow-md:   0 4px 16px rgba(28,24,20,0.08), 0 2px 6px rgba(28,24,20,0.05);
+    --shadow-lg:   0 12px 40px rgba(28,24,20,0.10), 0 4px 12px rgba(28,24,20,0.06);
+}
+
+/* ── Base Reset ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, .stApp {
+    background: var(--bg) !important;
+    color: var(--ink) !important;
+    font-family: var(--font-body) !important;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+
+/* ============================================================
+   FIX 1 — STREAMLIT TOOLBAR (Deploy / ⋮ menu)
+   Pin it fixed top-right on its own stacking layer.
+   Let all clicks pass through the transparent header strip
+   so nothing below gets blocked.
+   ============================================================ */
+header[data-testid="stHeader"] {
+    background:    transparent !important;
+    border-bottom: none !important;
+    position:      fixed !important;
+    top:    0 !important;
+    right:  0 !important;
+    left:   0 !important;
+    height: 2.75rem !important;
+    z-index: 999 !important;
+    pointer-events: none !important;   /* transparent to clicks */
+}
+
+/* Re-enable clicks on the actual toolbar widget */
+[data-testid="stToolbar"] {
+    position:       fixed !important;
+    top:   0 !important;
+    right: 0 !important;
+    z-index: 1000 !important;
+    background: transparent !important;
+    pointer-events: auto !important;
+}
+
+/* Push the page body down so hero never hides under the toolbar strip */
+.block-container {
+    padding: 3.5rem 3rem 4rem !important;
+    max-width: 1380px !important;
+}
+
+/* ============================================================
+   SIDEBAR
+   ============================================================ */
+section[data-testid="stSidebar"] {
+    background: var(--surface) !important;
+    border-right: 1px solid var(--border) !important;
+}
+
+section[data-testid="stSidebar"] > div { padding: 0 !important; }
+
+.sb-brand {
+    padding: 36px 24px 24px;
+    border-bottom: 1px solid var(--border-soft);
+}
+.sb-wordmark {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 20px;
+    color: var(--ink);
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+    margin-bottom: 6px;
+}
+.sb-caption {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--ink-ghost);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+
+.sb-section { padding: 20px 20px 14px; }
+.sb-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--ink-ghost);
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    padding-bottom: 7px;
+    border-bottom: 1px solid var(--border-soft);
+}
+.sb-rule { height: 1px; background: var(--border-soft); margin: 4px 0; }
+
+/* Status pill */
+.status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 14px;
+    border-radius: 100px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    width: 100%;
+    margin: 2px 0;
+}
+.status-pill.ok  { background: var(--green-soft);  color: var(--green);  border: 1px solid rgba(45,106,79,0.22); }
+.status-pill.err { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-mid); }
+
+.pulse {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); flex-shrink: 0;
+    animation: blink 2.4s ease-in-out infinite;
+}
+.dot-err { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.28; } }
+
+/* Source list */
+.source-item {
+    display: flex; align-items: center; gap: 9px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-soft);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-mid);
+}
+.source-item:last-child { border-bottom: none; }
+.source-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+
+/* Slider label */
+div[data-testid="stSlider"] label, .stSlider label {
+    font-family: var(--font-mono) !important;
+    font-size: 9.5px !important;
+    color: var(--ink-ghost) !important;
+    letter-spacing: 0.15em !important;
+    text-transform: uppercase !important;
+}
+
+/* ============================================================
+   FIX 2 — HERO HEADER
+   Typography aligned with Sidebar:
+     Title  → Playfair Display 700  (same as .sb-wordmark but large)
+     Eyebrow/Sub → IBM Plex Mono caps  (same as .sb-label / .sb-caption)
+     Timestamp   → IBM Plex Mono       (same as .sb-caption)
+   ============================================================ */
+.pg-hero {
+    margin-bottom: 36px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 24px;
+    padding: 36px 40px 34px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+    position: relative;
+    overflow: hidden;
+}
+/* Accent gradient stripe top */
+.pg-hero::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--accent) 0%, var(--amber) 55%, transparent 100%);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+/* Eyebrow — matches .sb-label style */
+.pg-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.20em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 12px;
+    display: flex; align-items: center; gap: 10px;
+}
+.pg-eyebrow::before {
+    content: '';
+    display: inline-block;
+    width: 20px; height: 1px;
+    background: var(--accent);
+    flex-shrink: 0;
+}
+
+/* Title — matches .sb-wordmark but scaled up */
+.pg-title {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(48px, 5.5vw, 72px);
+    color: var(--ink);
+    line-height: 1.06;
+    letter-spacing: -0.025em;
+    margin: 0;
+}
+.pg-title em { font-style: italic; color: var(--accent); }
+
+/* Sub line — matches .sb-caption */
+.pg-sub {
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--ink-ghost);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+}
+
+/* Timestamp */
+.pg-timestamp { text-align: right; flex-shrink: 0; }
+.pg-time-label {
+    font-family: var(--font-mono);
+    font-size: 9px; color: var(--ink-ghost);
+    letter-spacing: 0.18em; text-transform: uppercase;
+    margin-bottom: 5px;
+}
+.pg-time-value {
+    font-family: var(--font-mono);
+    font-size: 13px; color: var(--ink-mid);
+    font-weight: 500; line-height: 1.55;
+}
+
+/* ============================================================
+   KPI CARDS
+   ============================================================ */
+.kpi-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 36px;
+}
+.kpi-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 22px 22px 20px;
+    position: relative; overflow: hidden;
+    transition: box-shadow 0.2s, transform 0.2s;
+    cursor: default;
+}
+.kpi-card:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+
+.kpi-rule { position: absolute; top: 0; left: 22px; right: 22px; height: 2px; border-radius: 0 0 2px 2px; }
+.kpi-card.c-accent .kpi-rule { background: var(--accent); }
+.kpi-card.c-green  .kpi-rule { background: var(--green); }
+.kpi-card.c-amber  .kpi-rule { background: var(--amber); }
+.kpi-card.c-slate  .kpi-rule { background: var(--slate); }
+
+.kpi-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+
+/* Label → same as .sb-label */
+.kpi-lbl {
+    font-family: var(--font-mono) !important;
+    font-size: 9px !important;
+    letter-spacing: 0.18em !important;
+    text-transform: uppercase !important;
+    color: var(--ink-ghost) !important;
+}
+.kpi-icon-wrap {
+    width: 28px; height: 28px; border-radius: 7px;
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+.kpi-card.c-accent .kpi-icon-wrap { background: var(--accent-soft); }
+.kpi-card.c-green  .kpi-icon-wrap { background: var(--green-soft); }
+.kpi-card.c-amber  .kpi-icon-wrap { background: var(--amber-soft); }
+.kpi-card.c-slate  .kpi-icon-wrap { background: var(--slate-soft); }
+
+/* Number → Playfair Display, same as .sb-wordmark family */
+.kpi-val {
+    font-family: var(--font-display) !important;
+    font-weight: 400 !important;
+    font-size: 44px !important;
+    color: var(--ink) !important;
+    line-height: 1 !important;
+    letter-spacing: 0 !important;
+    margin-bottom: 6px;
+    font-variant-numeric: tabular-nums lining-nums !important;
+    font-feature-settings: "tnum" 1, "lnum" 1 !important;
+}
+/* Hint → IBM Plex Mono, same as .sb-caption */
+.kpi-hint {
+    font-family: var(--font-mono) !important;
+    font-size: 9.5px !important;
+    color: var(--ink-ghost) !important;
+    letter-spacing: 0.08em !important;
+}
+
+/* ============================================================
+   SECTION HEADER
+   ============================================================ */
+.sec-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
+
+/* Playfair Display title */
+.sec-title {
+    font-family: var(--font-display) !important;
+    font-size: 20px !important;
+    font-weight: 400 !important;
+    color: var(--ink) !important;
+    letter-spacing: -0.01em !important;
+}
+/* IBM Plex Mono chip */
+.sec-chip {
+    font-family: var(--font-mono);
+    font-size: 9px; color: var(--ink-ghost);
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: 3px 10px; border-radius: 100px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+}
+
+/* ============================================================
+   CHART PANELS
+   ============================================================ */
+.chart-panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 24px; box-shadow: var(--shadow-sm);
+}
+
+/* ============================================================
+   EMPTY STATES
+   ============================================================ */
+.empty {
+    background: var(--surface); border: 1px dashed var(--border);
+    border-radius: var(--radius-lg); padding: 52px 32px; text-align: center;
+}
+.empty-glyph { font-size: 28px; margin-bottom: 14px; opacity: 0.32; filter: grayscale(1); }
+.empty-msg { font-family: var(--font-display); font-size: 15px; color: var(--ink-faint); margin-bottom: 8px; }
+.empty-hint { font-family: var(--font-mono); font-size: 10px; color: var(--ink-ghost); letter-spacing: 0.06em; }
+.empty-hint code {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 7px; color: var(--accent);
+}
+
+/* ============================================================
+   DATA TABLE
+   ============================================================ */
+.stDataFrame { border-radius: var(--radius-md) !important; overflow: hidden !important; border: 1px solid var(--border) !important; }
+.stDataFrame thead th {
+    font-family: var(--font-mono) !important;
+    font-size: 9.5px !important; letter-spacing: 0.14em !important;
+    text-transform: uppercase !important;
+    background: var(--surface-2) !important; color: var(--ink-ghost) !important;
+}
+.stDataFrame tbody td {
+    font-family: var(--font-mono) !important;
+    font-size: 11.5px !important; color: var(--ink-mid) !important;
+}
+
+/* ============================================================
+   FOOTER
+   ============================================================ */
+.pg-footer {
+    margin-top: 40px; padding-top: 20px;
+    border-top: 1px solid var(--border-soft);
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 8px;
+}
+.footer-l, .footer-r {
+    font-family: var(--font-mono);
+    font-size: 9.5px; color: var(--ink-ghost);
+    letter-spacing: 0.12em; text-transform: uppercase;
+}
+
+/* ============================================================
+   TABS OVERRIDE
+   ============================================================ */
+.stTabs [data-baseweb="tab-list"] {
+    background: transparent !important; gap: 2px;
+    border-bottom: 1px solid var(--border) !important;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: var(--font-mono) !important;
+    font-size: 10px !important; letter-spacing: 0.14em !important;
+    text-transform: uppercase !important; color: var(--ink-ghost) !important;
+    padding: 10px 16px !important; background: transparent !important; border: none !important;
+}
+.stTabs [aria-selected="true"] { color: var(--accent) !important; border-bottom: 2px solid var(--accent) !important; }
+
+/* ============================================================
+   MISC HELPERS
+   ============================================================ */
+.gap-sm { margin-bottom: 14px; }
+.gap-md { margin-bottom: 24px; }
+.gap-lg { margin-bottom: 36px; }
