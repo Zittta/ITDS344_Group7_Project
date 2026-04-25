@@ -1,0 +1,8 @@
+# Core HTTP client (used in all ingestion DAGs)
+requests==2.31.0
+
+# MongoDB driver
+pymongo==4.6.1
+
+# Kafka Python client (used by DAGs that interact with Kafka)
+kafka-python==2.0.2
