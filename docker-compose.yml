@@ -180,7 +180,7 @@ services:
   # ─── Kafka Producer (Socrata API → Kafka) ────────────────────────────────────
   kafka-producer:
     build:
-      context: ./bronze-streaming
+      context: ./kafka
       dockerfile: Dockerfile
     command: python kafka_producer.py
     depends_on:
@@ -196,7 +196,7 @@ services:
   # ─── [STREAMING] Kafka Consumer — Kafka → MongoDB bronze ──────────────────────
   kafka-consumer-bronze:
     build:
-      context: ./bronze-streaming
+      context: ./kafka
       dockerfile: Dockerfile
     command: python consumer_bronze.py
     depends_on:

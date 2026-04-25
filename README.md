@@ -29,33 +29,52 @@ ITDS344 Data Engineering and Infrastructures (Semester 2/2568)
 
 ## Architecture
 
+ระบบแบ่งเป็น 3 Pipeline อิสระ ตาม 3 แหล่งข้อมูล แต่ละ Pipeline ครอบคลุม Bronze → Silver → Gold ในตัวเอง
+
 ```
-Socrata API ──► Kafka Producer ──► [Kafka Topics]
-                                         │
-                    ┌────────────────────┴────────────────────┐
-                    ▼                                         ▼
-          kafka-consumer-bronze                     Airflow DAGs (batch)
-          (writes raw to MongoDB)                   bronze_api_ingest (5 min)
-                    │                               bronze_population (manual)
-                    ▼
-            MongoDB: bronze DB  ◄──────────────────────────────┘
-            ├── seattle_911
-            ├── spd_crime
-            └── seattle_population
-                    │
-                    ▼  silver_transform DAG (10 min)
-            MongoDB: silver DB
-            ├── silver_911_clean
-            ├── silver_crime_clean
-            └── silver_population_clean
-                    │
-                    ▼  gold_analytics DAG (30 min)
-            MongoDB: gold DB
-            ├── fact_crime_events, fact_911_calls
-            ├── dim_time, dim_location, dim_offense, dim_event_type, dim_demographics
-            └── agg_crime_by_neighborhood_month, agg_crime_by_offense_category,
-                agg_911_by_hour_day, agg_crime_per_capita
+──────────────────── Pipeline 1: Seattle 911 (every 5 min) ────────────────────
+Socrata API (911) ──► bronze_ingest_911 ──► silver_transform_911
+  (streaming also:       [bronze.seattle_911]   [silver.silver_911_clean]
+Kafka → consumer)              │
+                               ▼
+                  ┌── gold_dim_time ──┐
+                  └── gold_dim_event_type ──┘
+                               ▼
+                    gold_fact_911_calls
+                               ▼
+                    gold_agg_911_by_hour_day
+
+──────────────────── Pipeline 2: SPD Crime (every 60 min) ─────────────────────
+Socrata API (crime) ──► bronze_ingest_crime ──► silver_transform_crime
+  (streaming also:        [bronze.spd_crime]     [silver.silver_crime_clean]
+Kafka → consumer)              │
+                               ▼
+          ┌── gold_dim_time ──┬── gold_dim_location ──┬── gold_dim_offense ──┐
+          └──────────────────┴──────────────────────┴──────────────────────┘
+                               ▼
+                    gold_fact_crime_events
+                               ▼
+          ┌── gold_agg_crime_by_neighborhood ─────────────────────┐
+          ├── gold_agg_crime_by_category ──────────────────────────┤
+          └── gold_agg_crime_per_capita (uses dim_demographics) ───┘
+
+──────────────── Pipeline 3: Seattle Population (run @once on deploy) ─────────
+CSV ──► validate_csv ──► bronze_load_population ──► silver_transform_population
+  [data/raw_csv/]   [bronze.seattle_population]   [silver.silver_population_clean]
+                               ▼
+                    gold_dim_demographics
+                   (ใช้โดย pipeline 2 ─ agg_crime_per_capita)
 ```
+
+**Streaming Path (Kafka):** Kafka Producer สำรองดึงข้อมูล 911 + Crime จาก Socrata แบบ real-time
+ส่งผ่าน Kafka → Consumer เข้า MongoDB bronze collections เดียวกัน (upsert idempotent)
+
+| Service | Port | ใช้สำหรับ |
+|---------|------|-----------|
+| Airflow UI | http://localhost:8080 | admin/admin |
+| Mongo Express | http://localhost:8081 | admin/admin |
+| MongoDB | localhost:27017 | direct connection |
+| Kafka | localhost:9092 | broker |
 
 | Service | Port | ใช้สำหรับ |
 |---------|------|-----------|
@@ -71,21 +90,20 @@ Socrata API ──► Kafka Producer ──► [Kafka Topics]
 ```
 ITDS344_Group7_Project/
 ├── dags/
-│   ├── bronze_api_ingest_dag.py       # Bronze: 911 + Crime จาก Socrata API
-│   ├── bronze_population_dag.py       # Bronze: ACS CSV → MongoDB (manual trigger)
-│   ├── silver_transform_dag.py        # Silver: clean + type + DQ checks
-│   └── gold_analytics_dag.py          # Gold: Star Schema + Aggregations
-├── bronze-streaming/
-│   ├── kafka_producer.py              # Poll Socrata API → publish to Kafka
-│   ├── consumer_bronze.py             # Kafka consumer → MongoDB bronze
+│   ├── dag_seattle_911.py          # Pipeline 1: 911  Bronze→Silver→Gold (every 5 min)
+│   ├── dag_spd_crime.py            # Pipeline 2: Crime Bronze→Silver→Gold (every 60 min)
+│   └── dag_seattle_population.py  # Pipeline 3: Pop  Bronze→Silver→Gold (@once on deploy)
+├── kafka/
+│   ├── kafka_producer.py           # Streaming: Poll Socrata API → Kafka topics
+│   ├── consumer_bronze.py          # Streaming: Kafka → MongoDB bronze (upsert)
 │   └── Dockerfile
 ├── data/
 │   └── raw_csv/
 │       └── seattle_neighborhoods_acs.csv  # ✅ tracked in git
 ├── docker-compose.yml
-├── .env                               # ❌ NOT in git — ต้องสร้างเอง (ดูด้านล่าง)
+├── .env                            # ❌ NOT in git — ต้องสร้างเอง (ดูด้านล่าง)
 ├── requirements.txt
-├── DATA_STRUCTURE.md                  # รายละเอียด schema ทุก collection + dashboard guide
+├── DATA_STRUCTURE.md               # รายละเอียด schema ทุก collection
 └── README.md
 ```
 
@@ -178,37 +196,35 @@ docker compose logs airflow-init
 
 ---
 
-### Step 5 — เปิด UI และ trigger DAGs
+### Step 5 — เปิด UI และตรวจสอบ DAGs
 
 เข้า **http://localhost:8080** (admin / admin)
 
-ควรเห็น 4 DAGs ทั้งหมด สถานะ **ON** (ไม่ต้อง toggle):
+ควรเห็น 3 DAGs สถานะ **ON** (ไม่ต้อง toggle):
 
-| DAG | Schedule | Action |
-|-----|----------|--------|
-| `bronze_api_ingest` | ทุก 5 นาที | รันอัตโนมัติ ✅ |
-| `bronze_population_ingest` | Manual | **Trigger ด้วยมือ** ▶ |
-| `silver_transform` | ทุก 10 นาที | รันอัตโนมัติ ✅ |
-| `gold_analytics` | ทุก 30 นาที | รันอัตโนมัติ ✅ |
+| DAG | Schedule | หมายเหตุ |
+|-----|----------|----------|
+| `seattle_population_pipeline` | `@once` | รันอัตโนมัติครั้งแรก ✅ (ต้องเสร็จก่อน pipeline อื่น) |
+| `seattle_911_pipeline` | ทุก 5 นาที | รันอัตโนมัติ ✅ |
+| `spd_crime_pipeline` | ทุก 60 นาที | รันอัตโนมัติ ✅ |
 
-**Trigger ตามลำดับนี้ครั้งแรก** (เพื่อให้ข้อมูลไหลเร็ว):
+> **สำคัญ:** `seattle_population_pipeline` จะรันอัตโนมัติ 1 ครั้งเมื่อ deploy (`@once`)
+> Pipeline นี้สร้าง `dim_demographics` ที่ `spd_crime_pipeline` ใช้สำหรับคำนวณ `agg_crime_per_capita`
+
+**ถ้าต้องการ trigger ด้วยมือ** (เช่น วาง CSV ใหม่):
 
 ```powershell
-# 1. Bronze API (รอ ~2 นาทีให้ดึงข้อมูลเสร็จ)
+# Trigger population pipeline (วาง CSV ใหม่ก่อน แล้วค่อย trigger)
 docker exec itds344_group7_project-airflow-scheduler-1 `
-  airflow dags trigger bronze_api_ingest
+  airflow dags trigger seattle_population_pipeline
 
-# 2. Bronze Population CSV
+# Trigger 911 pipeline ทันที (ไม่ต้องรอ schedule)
 docker exec itds344_group7_project-airflow-scheduler-1 `
-  airflow dags trigger bronze_population_ingest
+  airflow dags trigger seattle_911_pipeline
 
-# 3. Silver (หลัง bronze เสร็จ ~2 นาที)
+# Trigger crime pipeline ทันที
 docker exec itds344_group7_project-airflow-scheduler-1 `
-  airflow dags trigger silver_transform
-
-# 4. Gold (หลัง silver เสร็จ ~2 นาที)
-docker exec itds344_group7_project-airflow-scheduler-1 `
-  airflow dags trigger gold_analytics
+  airflow dags trigger spd_crime_pipeline
 ```
 
 ---

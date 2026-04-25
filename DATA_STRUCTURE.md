@@ -5,22 +5,31 @@
 
 ## Architecture Overview
 
+ระบบแบ่งเป็น **3 End-to-End Pipeline** แยกต่อแหล่งข้อมูล แต่ละ pipeline ครอบคลุม Bronze → Silver → Gold ในตัวเอง
+
 ```
-Socrata API ──► Kafka Producer ──► [bronze_911_calls / bronze_crime_reports topics]
-                                         │
-                                         ▼
-Airflow DAGs ──────────────────────────────────────────────────────────────────
-  bronze_api_ingest    ──► MongoDB  bronze  (raw API snapshots)
-  bronze_population    ──► MongoDB  bronze  (static ACS CSV)
-  silver_transform     ──► MongoDB  silver  (cleaned & typed)
-  gold_analytics       ──► MongoDB  gold    (Star Schema + Aggregations)
+Pipeline 1: dag_seattle_911      (every 5 min)
+  Socrata 911 API ──► bronze_ingest_911 ──► silver_transform_911
+  + Kafka streaming                  ──► gold_dim_time, gold_dim_event_type
+                                     ──► gold_fact_911_calls
+                                     ──► gold_agg_911_by_hour_day
+
+Pipeline 2: dag_spd_crime        (every 60 min)
+  Socrata Crime API ──► bronze_ingest_crime ──► silver_transform_crime
+  + Kafka streaming           ──► gold_dim_time, gold_dim_location, gold_dim_offense
+                              ──► gold_fact_crime_events
+                              ──► gold_agg_crime_by_neighborhood / by_category / per_capita
+
+Pipeline 3: dag_seattle_population  (@once on deploy, re-trigger when new CSV)
+  ACS CSV ──► validate_csv ──► bronze_load_population ──► silver_transform_population
+         ──► gold_dim_demographics  (ใช้โดย pipeline 2 — agg_crime_per_capita)
 ```
 
-| Layer  | MongoDB DB | Purpose                          | Refresh        |
-|--------|------------|----------------------------------|----------------|
-| Bronze | `bronze`   | Raw data, immutable, full fidelity | every 5 min   |
-| Silver | `silver`   | Typed, validated, deduplicated   | every 10 min   |
-| Gold   | `gold`     | Star Schema + pre-aggregated views | every 30 min |
+| Layer  | MongoDB DB | Purpose                            | Refresh                  |
+|--------|------------|------------------------------------|--------------------------|
+| Bronze | `bronze`   | Raw data, immutable, full fidelity | 911: 5 min / Crime: 60 min / Pop: @once |
+| Silver | `silver`   | Typed, validated, deduplicated     | ตาม Bronze ของแต่ละ source |
+| Gold   | `gold`     | Star Schema + pre-aggregated views | ตาม Silver ของแต่ละ source |
 
 ---
 

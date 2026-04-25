@@ -1,1 +1,0 @@
-# TODO: Silver Layer — Kafka Consumer + Transform
