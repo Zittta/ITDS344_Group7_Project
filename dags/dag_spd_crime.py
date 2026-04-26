@@ -345,6 +345,7 @@ def silver_transform_crime(**context) -> dict:
     skipped_dq   = 0
     now          = datetime.now(timezone.utc)
 
+
     for doc in cursor:
         if not doc.get("offense_id"):
             skipped_dq += 1
@@ -364,12 +365,50 @@ def silver_transform_crime(**context) -> dict:
 
         # Data cleaning: skip invalid neighborhoods
         neighborhood = (doc.get("neighborhood") or "").strip()
-        if neighborhood in ["UNKNOWN", "-", "REDACTED", "OOJ", ""] or neighborhood.startswith("99"):
+        if neighborhood in ["UNKNOWN", "UNKNOW", "-", "REDACTED", "OOJ", ""] or neighborhood.startswith("99"):
             skipped_dq += 1
             continue
 
-        lat = _safe_float(doc.get("latitude"))
-        lon = _safe_float(doc.get("longitude"))
+        # Data cleaning: skip if nibrs_crime_against_category is NOT_A_CRIME
+        nibrs_crime_against = (doc.get("nibrs_crime_against_category") or "").strip().upper()
+        if nibrs_crime_against == "NOT_A_CRIME":
+            skipped_dq += 1
+            continue
+
+        # Data cleaning: skip if beat or precinct is OOJ
+        beat = (doc.get("beat") or "").strip().upper()
+        precinct = (doc.get("precinct") or "").strip().upper()
+        if beat == "OOJ" or precinct == "OOJ":
+            skipped_dq += 1
+            continue
+
+        # Data cleaning: skip if nibrs_offense_code or offense_sub_category is 999 or offense_sub_category is UNKNOW or UNKNOWN
+        nibrs_offense_code = (doc.get("nibrs_offense_code") or "").strip()
+        offense_sub_category = (doc.get("offense_sub_category") or "").strip().upper()
+        if nibrs_offense_code == "999" or offense_sub_category in ("999", "UNKNOW", "UNKNOWN"):
+            skipped_dq += 1
+            continue
+
+        # Data cleaning: skip if sector startswith 99
+        sector = (doc.get("sector") or "").strip().upper()
+        if sector.startswith("99"):
+            skipped_dq += 1
+            continue
+
+        # Data cleaning: skip if block_address, census_block_2020, reporting_area, latitude, longitude is REDACTED
+        block_address = (doc.get("block_address") or "").strip().upper()
+        census_block_2020 = (doc.get("census_block_2020") or "").strip().upper()
+        reporting_area = (doc.get("reporting_area") or "").strip().upper()
+        lat_raw = doc.get("latitude")
+        lon_raw = doc.get("longitude")
+        lat = _safe_float(lat_raw)
+        lon = _safe_float(lon_raw)
+        if block_address == "REDACTED" or block_address == "-" or census_block_2020 == "REDACTED" or reporting_area == "REDACTED":
+            skipped_dq += 1
+            continue
+        if (isinstance(lat_raw, str) and lat_raw.strip().upper() == "REDACTED") or (isinstance(lon_raw, str) and lon_raw.strip().upper() == "REDACTED"):
+            skipped_dq += 1
+            continue
         if lat is not None and not -90 <= lat <= 90:
             lat = None
         if lon is not None and not -180 <= lon <= 180:
@@ -385,19 +424,20 @@ def silver_transform_crime(**context) -> dict:
             "report_date_time":               report_dt,
             "offense_date":                   _parse_dt(doc.get("offense_date", "")),
             "offense_category":               offense_cat,
-            "offense_sub_category":           (doc.get("offense_sub_category") or "").strip().upper(),
-            "nibrs_offense_code":             (doc.get("nibrs_offense_code") or "").strip(),
+            "offense_sub_category":           offense_sub_category,
+            "nibrs_offense_code":             nibrs_offense_code,
             "nibrs_offense_code_description": (doc.get("nibrs_offense_code_description") or "").strip(),
-            "nibrs_crime_against_category":   (doc.get("nibrs_crime_against_category") or "").strip().upper(),
+            "nibrs_crime_against_category":   nibrs_crime_against,
             "nibrs_group":                    (doc.get("nibrs_group_a_b") or "").strip().upper(),
             "is_shooting":                    is_shooting,
-            "block_address":                  (doc.get("block_address") or "").strip(),
+            "block_address":                  block_address,
             "latitude":                       lat,
             "longitude":                      lon,
-            "precinct":                       (doc.get("precinct") or "").strip().upper(),
-            "sector":                         (doc.get("sector") or "").strip().upper(),
-            "beat":                           (doc.get("beat") or "").strip().upper(),
+            "precinct":                       precinct,
+            "sector":                         sector,
+            "beat":                           beat,
             "neighborhood":                   neighborhood,
+            "census_block_2020":              census_block_2020,
             "reporting_area":                 (doc.get("reporting_area") or "").strip(),
             "_source":                        "spd_crime",
             "_bronze_ingested_at":            doc.get("_ingested_at"),
@@ -499,6 +539,9 @@ def gold_dim_offense(**context) -> dict:
     ):
         code     = doc.get("nibrs_offense_code", "")
         category = doc.get("offense_category", "")
+        offense_sub_category = (doc.get("offense_sub_category", "") or "").strip().upper()
+        if offense_sub_category in ("UNKNOW", "UNKNOWN"):
+            continue
         oid      = _hash_key(code, category)
         if oid not in seen:
             seen[oid] = {

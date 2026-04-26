@@ -513,6 +513,7 @@ with col_date:
     else:
         st.write("")  # Empty space
 
+period_label = "All Time"  # Default label ป้องกัน NameError
 # Filter data based on selection
 crime_filtered = crime_raw.copy()
 calls_filtered = calls_raw.copy()

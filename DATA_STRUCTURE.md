@@ -104,7 +104,15 @@ Contains **100+ demographic fields** from US Census ACS including:
 
 ## Silver Layer
 
-> **DQ Rules applied:** required fields non-null, datetimes parse correctly, lat/lon within valid WGS84 range, in-batch deduplication on business key.
+> **DQ Rules applied:**
+> - required fields non-null
+> - datetimes parse correctly
+> - lat/lon within valid WGS84 range
+> - in-batch deduplication on business key
+> - **offense_category**: drop UNKNOWN, NOT_A_CRIME, REDACTED, OOJ, "-", empty, or values starting with "99"
+> - **offense_sub_category**: drop UNKNOW, UNKNOWN, 999
+> - **neighborhood**: drop UNKNOWN, UNKNOW, REDACTED, OOJ, "-", empty, or values starting with "99"
+> - **block_address**: drop "REDACTED", "-"
 
 ### `silver.silver_911_clean`
 **Volume:** 282,382 documents  
@@ -134,7 +142,9 @@ Contains **100+ demographic fields** from US Census ACS including:
 
 **Data Quality Filters Applied:**
 - Drop rows with invalid `offense_category`: UNKNOWN, NOT_A_CRIME, REDACTED, OOJ, "-", empty, or starting with "99"
-- Drop rows with invalid `neighborhood`: UNKNOWN, "-", REDACTED, OOJ, empty, or starting with "99"
+- Drop rows with invalid `offense_sub_category`: UNKNOW, UNKNOWN, 999
+- Drop rows with invalid `neighborhood`: UNKNOWN, UNKNOW, "-", REDACTED, OOJ, empty, or starting with "99"
+- Drop rows with invalid `block_address`: "REDACTED", "-"
 - Approximately 14,000 rows filtered out (~7.6% of raw data)
 
 | Field                          | Type    | Transformation from Bronze                        |
@@ -144,7 +154,7 @@ Contains **100+ demographic fields** from US Census ACS including:
 | `report_date_time`             | ISODate | string → parsed ISODate (UTC)                     |
 | `offense_date`                 | ISODate | string → parsed ISODate (UTC)                     |
 | `offense_category`             | String  | `.strip().upper()`                                |
-| `offense_sub_category`         | String  | `.strip()`                                        |
+| `offense_sub_category`         | String  | `.strip().upper()`                                |
 | `nibrs_offense_code`           | String  | unchanged                                         |
 | `nibrs_offense_code_description` | String | unchanged                                       |
 | `nibrs_crime_against_category` | String  | unchanged                                         |
@@ -211,6 +221,7 @@ Contains **100+ demographic fields** from US Census ACS including:
 
 **Optimized for:** Dashboard queries using neighborhood, offense_category, is_shooting filters  
 **DQ Impact:** ~14K rows filtered out during silver transform (~7.6% of raw data)
+**Note:** gold.dim_offense จะไม่สร้าง row ที่ offense_sub_category เป็น UNKNOW หรือ UNKNOWN
 
 ---
 
@@ -367,8 +378,12 @@ All three layers are protected against duplicate data. Verified on 2026-04-25:
 | `gold.agg_911_by_hour_day` | 168 | ✅ Healthy | 24h × 7 days heatmap |
 | `gold.agg_crime_per_capita` | 87 | ✅ Healthy | Rate per 10K population |
 
-**Total Collections:** 14 (Bronze: 3, Silver: 3, Gold: 8)  
+**Total Collections:** 14 (Bronze: 3, Silver: 3, Gold: 8)
 **Removed Collections:** dim_time, dim_event_type, agg_crime_by_neighborhood_month (not used by dashboard)
+**Latest DQ:**
+- gold.dim_offense: ไม่สร้าง row ที่ offense_sub_category เป็น UNKNOW หรือ UNKNOWN
+- silver.silver_crime_clean: ไม่รับ row ที่ offense_sub_category เป็น UNKNOW, UNKNOWN, 999
+- silver.silver_crime_clean: ไม่รับ row ที่ block_address เป็น "-" หรือ "REDACTED"
 
 ---
 

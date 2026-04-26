@@ -62,10 +62,14 @@ Kafka → consumer)              │                 (with data quality filters)
 **Tasks: 6** (bronze → silver → [2 dims] → fact → [2 aggs])  
 **Duration: ~90-120 sec/run**
 
-**Data Quality Rules:**
-- Skip rows with invalid offense_category: UNKNOWN, NOT_A_CRIME, REDACTED, OOJ, "-", or values starting with "99"
-- Skip rows with invalid neighborhood: UNKNOWN, "-", REDACTED, OOJ, or values starting with "99"
+**Data Quality Rules (DQ):**
+- Drop rows with invalid `offense_category`: UNKNOWN, NOT_A_CRIME, REDACTED, OOJ, "-", empty, or values starting with "99"
+- Drop rows with invalid `offense_sub_category`: UNKNOW, UNKNOWN, 999
+- Drop rows with invalid `neighborhood`: UNKNOWN, UNKNOW, "-", REDACTED, OOJ, empty, or values starting with "99"
+- Drop rows with invalid `block_address`: "REDACTED", "-"
 - is_shooting: True only if shooting_type_group contains "Shots Fired" or "Shooting" (case-insensitive)
+
+**หมายเหตุ:** หากข้อมูลใน gold layer ว่างหรือ dashboard แสดง "No data" อาจเกิดจาก DQ filter ที่เข้มงวดมากขึ้น (เช่น ข้อมูลใหม่มีแต่ค่าที่ถูกกรองทิ้ง)
 
 ──────────────── Pipeline 3: Seattle Population (run @once on deploy) ─────────
 CSV ──► validate_csv ──► bronze_load_population ──► silver_transform_population
@@ -254,15 +258,16 @@ docker exec itds344_group7_project-airflow-scheduler-1 `
 | `bronze` | `spd_crime` | ~184,000 | Raw crime reports |
 | `bronze` | `seattle_population` | 87 | ACS demographics by neighborhood |
 | `silver` | `silver_911_clean` | ~282,000 | Cleaned 911 data |
-| `silver` | `silver_crime_clean` | ~170,000 | Cleaned crime data (with DQ filters) |
-| `gold` | `fact_crime_events` | ~170,000 | Crime fact table (optimized fields) |
+| `silver` | `silver_crime_clean` | ~170,000 | Cleaned crime data (**DQ filter: ~14K dropped**)
+| `silver` | `silver_population_clean` | 87 | Cleaned/validated population |
+| `gold` | `fact_crime_events` | ~170,000 | Crime fact table (DQ-enforced) |
 | `gold` | `fact_911_calls` | ~282,000 | 911 calls fact table |
-| `gold` | `dim_location` | 283 | Location dimension (precinct/sector/beat/neighborhood) |
-| `gold` | `dim_offense` | 61 | Offense dimension (NIBRS codes) |
-| `gold` | `dim_demographics` | 87 | Demographics dimension (used by per-capita calc) |
-| `gold` | `agg_911_by_hour_day` | 168 | 911 calls by hour × day (24 × 7) |
+| `gold` | `dim_location` | 283 | Location dimension |
+| `gold` | `dim_offense` | 61 | Offense dimension (no UNKNOWN/UNKNOW) |
+| `gold` | `dim_demographics` | 87 | Demographics dimension |
+| `gold` | `agg_911_by_hour_day` | 168 | 911 calls by hour × day |
 | `gold` | `agg_crime_by_offense_category` | 84 | Crime counts by category × month |
-| `gold` | `agg_crime_per_capita` | 87 | Crime rate per 10K population by neighborhood |
+| `gold` | `agg_crime_per_capita` | 87 | Crime rate per 10K population |
 
 หรือตรวจสอบผ่าน terminal:
 
@@ -321,7 +326,7 @@ docker exec -it itds344_group7_project-mongo-1 mongosh
 
 ## Data Schema & Dashboard Guide
 
-ดูรายละเอียด schema ทุก collection และคำแนะนำ Dashboard ได้ที่ [DATA_STRUCTURE.md](DATA_STRUCTURE.md)
+**ดูรายละเอียด schema ทุก collection, field, และ DQ rule ล่าสุดได้ที่ [DATA_STRUCTURE.md](DATA_STRUCTURE.md)**
 
 ---
 
