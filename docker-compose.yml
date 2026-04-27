@@ -13,7 +13,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
     # Extra packages installed at container start
-    _PIP_ADDITIONAL_REQUIREMENTS: 'requests==2.31.0 pymongo==4.6.1 kafka-python==2.0.2 streamlit==1.32.2 plotly==5.18.0 pandas==2.2.2'
+    _PIP_ADDITIONAL_REQUIREMENTS: 'requests==2.31.0 pymongo==4.6.1 kafka-python==2.0.0 six==1.16.0 streamlit==1.32.2 plotly==5.18.0 pandas==2.2.2'
     # Project secrets (loaded from .env)
     SOCRATA_APP_TOKEN: ${SOCRATA_APP_TOKEN}
     MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}

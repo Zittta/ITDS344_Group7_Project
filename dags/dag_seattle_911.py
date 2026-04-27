@@ -160,91 +160,74 @@ def _set_gold_wm(db_gold, source: str, ts: datetime) -> None:
 
 def bronze_ingest_911(**context) -> dict:
     """
-    Fetches new 911 call records from Socrata API (watermark-based incremental).
+    Consumes new 911 call records from Kafka topic 'bronze_911_calls'.
     DQ Rule 1: required fields (incident_number, datetime) must be non-empty.
     DQ Rule 2: timestamp field must be present and parseable.
     Idempotency: upsert on incident_number — re-runs are safe.
     """
+    from kafka import KafkaConsumer
+    import json
+
     cfg    = SOURCE_CFG
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
     db     = client[BRONZE_DB]
     db["seattle_911"].create_index(cfg["unique_key"], background=True)
 
-    watermark = _get_bronze_wm(db)
-    ts_field  = cfg["timestamp_field"]
-    log.info("[Bronze-911] Fetching records since %s", watermark)
+    consumer = KafkaConsumer(
+        "bronze_911_calls",
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP", "kafka:9092"),
+        group_id="bronze_ingest_911",
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+    )
 
-    headers     = {"X-App-Token": SOCRATA_TOKEN} if SOCRATA_TOKEN else {}
-    all_records: list[dict] = []
-    offset      = 0
-
-    while True:
-        params = {
-            "$where":  f"{ts_field} > '{watermark}'",
-            "$limit":  BATCH_SIZE,
-            "$offset": offset,
-            "$order":  f"{ts_field} ASC",
-        }
-        try:
-            resp = requests.get(cfg["api_url"], headers=headers, params=params, timeout=120)
-            resp.raise_for_status()
-            batch: list[dict] = resp.json()
-        except requests.RequestException as exc:
-            log.error("[Bronze-911] API error: %s", exc)
-            client.close()
-            raise
-
-        if not batch:
-            break
-        all_records.extend(batch)
-        log.info("[Bronze-911] page=%d total_so_far=%d", len(batch), len(all_records))
-        if len(batch) < BATCH_SIZE:
-            break
-        offset += BATCH_SIZE
-
-    if not all_records:
-        log.info("[Bronze-911] No new records")
-        client.close()
-        return {"fetched": 0, "skipped_dq": 0}
-
-    # DQ validation
-    valid, skipped_dq = [], 0
-    for rec in all_records:
+    buffer = []
+    total_upserted = 0
+    skipped_dq = 0
+    ts_field = cfg["timestamp_field"]
+    for message in consumer:
+        rec = message.value
+        # DQ check
         if any(not rec.get(f) for f in cfg["required_fields"]):
             skipped_dq += 1
             continue
         if not rec.get(ts_field):
             skipped_dq += 1
             continue
-        valid.append(rec)
-    log.info("[Bronze-911] DQ: total=%d valid=%d skipped=%d",
-             len(all_records), len(valid), skipped_dq)
-
-    # Upsert in chunks
-    collection     = db["seattle_911"]
-    now            = datetime.now(timezone.utc)
-    total_upserted = 0
-    for i in range(0, len(valid), UPSERT_CHUNK):
-        chunk = valid[i:i + UPSERT_CHUNK]
-        ops   = [
+        buffer.append(rec)
+        if len(buffer) >= UPSERT_CHUNK:
+            now = datetime.now(timezone.utc)
+            ops = [
+                UpdateOne(
+                    {cfg["unique_key"]: r[cfg["unique_key"]]},
+                    {
+                        "$setOnInsert": {**r, "_source": "seattle_911", "_ingested_at": now},
+                        "$set": {"_last_seen_at": now},
+                    },
+                    upsert=True,
+                )
+                for r in buffer
+            ]
+            total_upserted += _bulk_upsert(db["seattle_911"], ops, "bronze-911")
+            buffer = []
+    # Flush remaining
+    if buffer:
+        now = datetime.now(timezone.utc)
+        ops = [
             UpdateOne(
-                {cfg["unique_key"]: rec[cfg["unique_key"]]},
+                {cfg["unique_key"]: r[cfg["unique_key"]]},
                 {
-                    "$setOnInsert": {**rec, "_source": "seattle_911", "_ingested_at": now},
-                    "$set":         {"_last_seen_at": now},
+                    "$setOnInsert": {**r, "_source": "seattle_911", "_ingested_at": now},
+                    "$set": {"_last_seen_at": now},
                 },
                 upsert=True,
             )
-            for rec in chunk
+            for r in buffer
         ]
-        total_upserted += _bulk_upsert(collection, ops, "bronze-911")
-
-    max_dt = max(r[ts_field] for r in valid if r.get(ts_field))
-    _set_bronze_wm(db, max_dt)
-    log.info("[Bronze-911] Done: fetched=%d upserted=%d skipped_dq=%d watermark=%s",
-             len(all_records), total_upserted, skipped_dq, max_dt)
+        total_upserted += _bulk_upsert(db["seattle_911"], ops, "bronze-911")
     client.close()
-    return {"fetched": len(all_records), "upserted": total_upserted, "skipped_dq": skipped_dq}
+    return {"upserted": total_upserted, "skipped_dq": skipped_dq}
 
 
 # ─── Task 2: Silver Transform ─────────────────────────────────────────────────
