@@ -518,27 +518,34 @@ period_label = "All Time"  # Default label ป้องกัน NameError
 crime_filtered = crime_raw.copy()
 calls_filtered = calls_raw.copy()
 
-if not crime_raw.empty and "offense_date" in crime_raw.columns:
-    crime_filtered["offense_datetime"] = pd.to_datetime(crime_filtered["offense_date"], errors="coerce")
-    
+
+
+# --- Filter crimes by report_date_time เท่านั้น ไม่มี fallback ---
+if not crime_raw.empty and "report_date_time" in crime_raw.columns:
+    crime_filtered = crime_raw.copy()
+    crime_filtered["_dashboard_datetime"] = pd.to_datetime(crime_filtered["report_date_time"], errors="coerce")
+
     if time_period == "Today":
-        today = pd.Timestamp.now().date()
-        crime_filtered = crime_filtered[crime_filtered["offense_datetime"].dt.date == today]
-        period_label = f"Today ({today.strftime('%B %d, %Y')})"
+        today_utc = pd.Timestamp.now(tz="UTC").date()
+        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == today_utc]
+        period_label = f"Today ({today_utc.strftime('%B %d, %Y')})"
     elif time_period == "Select Day" and selected_date:
-        crime_filtered = crime_filtered[crime_filtered["offense_datetime"].dt.date == selected_date]
+        # selected_date is naive, treat as UTC date
+        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == selected_date]
         period_label = selected_date.strftime("%B %d, %Y")
     elif time_period == "Select Month" and selected_month and selected_year:
         crime_filtered = crime_filtered[
-            (crime_filtered["offense_datetime"].dt.year == selected_year) &
-            (crime_filtered["offense_datetime"].dt.month == selected_month)
+            (crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year) &
+            (crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.month == selected_month)
         ]
         period_label = f"{pd.Timestamp(selected_year, selected_month, 1).strftime('%B %Y')}"
     elif time_period == "Select Year" and selected_year:
-        crime_filtered = crime_filtered[crime_filtered["offense_datetime"].dt.year == selected_year]
+        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year]
         period_label = str(selected_year)
     else:  # All Time
         period_label = "All Time"
+else:
+    crime_filtered = pd.DataFrame()  # ไม่มีข้อมูลหรือไม่มี field
 
 if not calls_raw.empty and "call_datetime" in calls_raw.columns:
     calls_filtered["call_datetime_parsed"] = pd.to_datetime(calls_filtered["call_datetime"], errors="coerce")
@@ -558,8 +565,35 @@ if not calls_raw.empty and "call_datetime" in calls_raw.columns:
 
 st.caption(f"📅 Showing data for: **{period_label}**")
 
+
 # ═══ KPI CARDS ROW (4 cards in grid) ═════════════════════════
 col1, col2, col3, col4 = st.columns(4)
+
+
+
+
+
+
+# --- Filter 911 Calls by call_datetime เท่านั้น ไม่มี fallback ---
+if not calls_raw.empty and "call_datetime" in calls_raw.columns:
+    calls_filtered = calls_raw.copy()
+    calls_filtered["_dashboard_datetime"] = pd.to_datetime(calls_filtered["call_datetime"], errors="coerce")
+
+    if time_period == "Today":
+        today_utc = pd.Timestamp.now(tz="UTC").date()
+        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == today_utc]
+    elif time_period == "Select Day" and selected_date:
+        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == selected_date]
+    elif time_period == "Select Month" and selected_month and selected_year:
+        calls_filtered = calls_filtered[
+            (calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year) &
+            (calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.month == selected_month)
+        ]
+    elif time_period == "Select Year" and selected_year:
+        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year]
+    # else: All Time (no filter)
+else:
+    calls_filtered = pd.DataFrame()  # ไม่มีข้อมูลหรือไม่มี field
 
 crime_count = len(crime_filtered)
 calls_count = len(calls_filtered)
@@ -571,14 +605,16 @@ shooting_rate = (shooting_count / crime_count * 100) if crime_count > 0 else 0
 police_sent_count = calls_filtered["is_police_sent"].sum() if "is_police_sent" in calls_filtered.columns else 0
 police_response_rate = (police_sent_count / calls_count * 100) if calls_count > 0 else 0
 
+
 with col1:
-    st.metric("Total Crimes", f"{crime_count:,}", "SPD Records")
+    st.metric("Total Crimes", f"{crime_count:,}")
 
 with col2:
-    st.metric("911 Calls", f"{calls_count:,}", "Emergency Dispatches")
+    st.metric("911 Calls", f"{calls_count:,}")
 
 with col3:
-    st.metric("Shooting Incidents", f"{int(shooting_count):,}", f"{shooting_rate:.1f}% of crimes")
+    st.metric("Shooting Incidents", f"{int(shooting_count):,}")
+
 
 # View detailed data
 with st.expander("📋 View Detailed Records"):
@@ -586,43 +622,37 @@ with st.expander("📋 View Detailed Records"):
     
     with tab1:
         if not crime_filtered.empty:
-            # Select columns to display
-            display_cols = [c for c in ["offense_id", "offense_date", "offense_category", 
-                                       "offense_sub_category", "neighborhood", "precinct", "is_shooting"]
-                           if c in crime_filtered.columns]
-            
+            # Always show report_date_time if present
+            base_cols = ["offense_id", "report_date_time", "offense_date", "offense_category", 
+                         "offense_sub_category", "neighborhood", "precinct", "is_shooting"]
+            display_cols = [c for c in base_cols if c in crime_filtered.columns]
             if display_cols:
-                crime_display = crime_filtered[display_cols].head(100).copy()
-                
-                # Format datetime column if exists
+                crime_display = crime_filtered[display_cols].tail(100).copy()
+                # Format datetime columns as UTC (GMT+0000)
                 if "offense_date" in crime_display.columns:
-                    crime_display["offense_date"] = pd.to_datetime(crime_display["offense_date"]).dt.strftime("%Y-%m-%d %H:%M")
-                
+                    crime_display["offense_date"] = pd.to_datetime(crime_display["offense_date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
+                if "report_date_time" in crime_display.columns:
+                    crime_display["report_date_time"] = pd.to_datetime(crime_display["report_date_time"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
                 st.dataframe(crime_display, use_container_width=True, height=400, hide_index=True)
-                st.caption(f"📊 Showing first 100 of {len(crime_filtered):,} total crimes")
+                st.caption(f"📊 Showing last 100 of {len(crime_filtered):,} total crimes")
             else:
-                st.dataframe(crime_filtered.head(100), use_container_width=True, height=400, hide_index=True)
+                st.dataframe(crime_filtered.tail(100), use_container_width=True, height=400, hide_index=True)
         else:
             st.info("No crime records for the selected period")
     
     with tab2:
         if not calls_filtered.empty:
-            # Select columns to display
             display_cols = [c for c in ["event_id", "call_datetime", "event_type", 
                                        "address", "is_police_sent", "latitude", "longitude"]
                            if c in calls_filtered.columns]
-            
             if display_cols:
-                calls_display = calls_filtered[display_cols].head(100).copy()
-                
-                # Format datetime column if exists
+                calls_display = calls_filtered[display_cols].tail(100).copy()
                 if "call_datetime" in calls_display.columns:
-                    calls_display["call_datetime"] = pd.to_datetime(calls_display["call_datetime"]).dt.strftime("%Y-%m-%d %H:%M")
-                
+                    calls_display["call_datetime"] = pd.to_datetime(calls_display["call_datetime"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
                 st.dataframe(calls_display, use_container_width=True, height=400, hide_index=True)
-                st.caption(f"📊 Showing first 100 of {len(calls_filtered):,} total 911 calls")
+                st.caption(f"📊 Showing last 100 of {len(calls_filtered):,} total 911 calls")
             else:
-                st.dataframe(calls_filtered.head(100), use_container_width=True, height=400, hide_index=True)
+                st.dataframe(calls_filtered.tail(100), use_container_width=True, height=400, hide_index=True)
         else:
             st.info("No 911 call records for the selected period")
 
