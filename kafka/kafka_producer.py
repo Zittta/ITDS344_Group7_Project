@@ -165,27 +165,9 @@ def _fetch_and_publish(producer: KafkaProducer, source: dict) -> None:
 
 def main() -> None:
     producer = _create_producer()
-
-    # Track next poll time per source
-    next_poll: dict[str, float] = {s["name"]: 0.0 for s in SOURCES}
-
-    log.info("Kafka producer started. Watching %d sources.", len(SOURCES))
-
-    while True:
-        now = time.monotonic()
-
-        for source in SOURCES:
-            if now >= next_poll[source["name"]]:
-                try:
-                    _fetch_and_publish(producer, source)
-                except Exception as exc:
-                    log.exception(
-                        "[%s] Unexpected error during fetch/publish: %s",
-                        source["name"], exc,
-                    )
-                next_poll[source["name"]] = time.monotonic() + source["poll_interval_seconds"]
-
-        time.sleep(10)  # Check every 10s whether any source is due
+    for source in SOURCES:
+        _fetch_and_publish(producer, source)
+    log.info("Kafka producer finished one-shot fetch and publish.")
 
 
 if __name__ == "__main__":

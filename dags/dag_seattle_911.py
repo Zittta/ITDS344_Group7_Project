@@ -442,11 +442,6 @@ with DAG(
     max_active_runs=1,
 ) as dag:
 
-    t_bronze = PythonOperator(
-        task_id="bronze_ingest_911",
-        python_callable=bronze_ingest_911,
-        doc_md="Fetch new 911 records from Socrata API → bronze.seattle_911 (watermark-based)",
-    )
     t_silver = PythonOperator(
         task_id="silver_transform_911",
         python_callable=silver_transform_911,
@@ -463,5 +458,5 @@ with DAG(
         doc_md="Materialise agg_911_by_hour_day (full rebuild)",
     )
 
-    # Bronze → Silver → fact_911_calls → agg
-    t_bronze >> t_silver >> t_fact >> t_agg
+    # Silver → fact_911_calls → agg
+    t_silver >> t_fact >> t_agg

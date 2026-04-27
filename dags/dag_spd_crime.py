@@ -745,11 +745,6 @@ with DAG(
     max_active_runs=1,
 ) as dag:
 
-    t_bronze = PythonOperator(
-        task_id="bronze_ingest_crime",
-        python_callable=bronze_ingest_crime,
-        doc_md="Fetch new SPD crime records from Socrata API → bronze.spd_crime",
-    )
     t_silver = PythonOperator(
         task_id="silver_transform_crime",
         python_callable=silver_transform_crime,
@@ -781,5 +776,5 @@ with DAG(
         doc_md="Materialise agg_crime_per_capita — joins with dim_demographics",
     )
 
-    # Bronze → Silver → [dim_location, dim_offense] → fact → [agg x2]
-    t_bronze >> t_silver >> [t_dim_loc, t_dim_off] >> t_fact >> [t_agg_cat, t_agg_pc]
+    # Silver → [dim_location, dim_offense] → fact → [agg x2]
+    t_silver >> [t_dim_loc, t_dim_off] >> t_fact >> [t_agg_cat, t_agg_pc]
