@@ -206,8 +206,6 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
-      airflow-init-trigger:
-        condition: service_completed_successfully
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}/dashboard:/opt/airflow/dashboard
     restart: always
