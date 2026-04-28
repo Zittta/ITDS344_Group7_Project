@@ -4,24 +4,23 @@ Seattle 911 Pipeline — End-to-End  (Socrata API → Bronze → Silver → Gold
 Full medallion pipeline for Seattle Real-Time Fire 911 Calls data source.
 
 Flow:
-  bronze_ingest_911
+  silver_transform_911          (Task 1)
       ↓
-  silver_transform_911
-      ↓  [parallel]
-  gold_dim_time ──────┐
-  gold_dim_event_type ┤
-      ↓  [both done] ─┘
-  gold_fact_911_calls
+  gold_fact_911_calls           (Task 2)
       ↓
-  gold_agg_911_by_hour_day
+  gold_agg_911_by_hour_day      (Task 3)
 
-Bronze:  Socrata API (kzjm-xkqj) → MongoDB bronze.seattle_911
+Bronze:  Kafka consumer_bronze.py (Docker service) → MongoDB bronze.seattle_911
 Silver:  bronze.seattle_911 → silver.silver_911_clean
-Gold:    silver.silver_911_clean → gold.dim_time, gold.dim_event_type,
-                                    gold.fact_911_calls, gold.agg_911_by_hour_day
+Gold:    silver.silver_911_clean → gold.fact_911_calls
+                                 → gold.agg_911_by_hour_day
 
-Note: gold_dim_time upserts are idempotent — safe to run concurrently with
-      spd_crime_pipeline which also upserts into gold.dim_time.
+Gold collections built by this DAG:
+  fact_911_calls          — 1 row per 911 dispatch call (with neighborhood)
+  agg_911_by_hour_day     — 911 volume by hour × day-of-week heatmap
+
+Note: gold.dim_neighborhood and gold.agg_neighborhood_safety_profile are built
+      by the spd_crime_pipeline (which has full neighborhood coverage).
 
 Schedule: every 5 minutes (incremental watermark-based load)
 """
@@ -248,12 +247,16 @@ def silver_transform_911(**context) -> dict:
     return {"processed": processed, "skipped_dq": skipped_dq}
 
 
-# ─── Task 3: Gold — fact_911_calls ───────────────────────────────────────────
+# ─── Task 2: Gold — fact_911_calls ───────────────────────────────────────────
 
 def gold_fact_911(**context) -> dict:
     """
     Builds gold.fact_911_calls from silver.silver_911_clean.
-    Incremental load via gold watermark. Joins dim_time + dim_event_type.
+    Incremental load via gold watermark.
+
+    Enrichment: joins dim_neighborhood (built by crime pipeline) to add
+    neighborhood_name to each 911 call via nearest-location lookup.
+    Falls back to None if no neighborhood match found.
     """
     client    = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
     db_silver = client[SILVER_DB]
@@ -262,10 +265,28 @@ def gold_fact_911(**context) -> dict:
     coll.create_index("event_id", unique=True, background=True)
 
     watermark = _get_gold_wm(db_gold, "fact_911_calls")
-    et_idx    = {
-        d["event_type"]: d["event_type_id"]
-        for d in db_gold["dim_event_type"].find({}, {"event_type_id": 1, "event_type": 1})
-    }
+
+    # Build neighborhood lookup index from dim_neighborhood for geo-matching
+    # Maps neighborhood_name → (lat, lon) for nearest-neighbor enrichment
+    nbhd_coords: list[dict] = list(db_gold["dim_neighborhood"].find(
+        {"lat": {"$ne": None}, "lon": {"$ne": None}},
+        {"_id": 0, "neighborhood_name": 1, "lat": 1, "lon": 1},
+    ))
+
+    def _nearest_neighborhood(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
+        """Return closest neighborhood by Euclidean distance (approximation)."""
+        if lat is None or lon is None or not nbhd_coords:
+            return None
+        best_name  = None
+        best_dist2 = float("inf")
+        for n in nbhd_coords:
+            dlat = lat - n["lat"]
+            dlon = lon - n["lon"]
+            d2   = dlat * dlat + dlon * dlon
+            if d2 < best_dist2:
+                best_dist2 = d2
+                best_name  = n["neighborhood_name"]
+        return best_name
 
     cursor     = db_silver["silver_911_clean"].find(
         {"_silver_processed_at": {"$gt": watermark}},
@@ -283,18 +304,30 @@ def gold_fact_911(**context) -> dict:
             continue
 
         call_dt = doc.get("call_datetime")
-        time_id = int(call_dt.strftime("%Y%m%d%H")) if isinstance(call_dt, datetime) else None
-        et_id   = et_idx.get(doc.get("event_type", ""))
+        lat     = doc.get("latitude")
+        lon     = doc.get("longitude")
+
+        # Derive time dimensions
+        year       = call_dt.year           if isinstance(call_dt, datetime) else None
+        month      = call_dt.month          if isinstance(call_dt, datetime) else None
+        hour       = call_dt.hour           if isinstance(call_dt, datetime) else None
+        day_of_week = call_dt.weekday()     if isinstance(call_dt, datetime) else None  # 0=Mon…6=Sun
+
+        # Geo-enrich: assign neighborhood via nearest-centroid lookup
+        neighborhood = _nearest_neighborhood(lat, lon)
 
         fact_doc = {
             "event_id":             event_id,
-            "time_id":              time_id,
-            "event_type_id":        et_id,
-            "event_type":           doc.get("event_type", ""),
             "call_datetime":        call_dt,
+            "year":                 year,
+            "month":                month,
+            "hour":                 hour,
+            "day_of_week":          day_of_week,
+            "event_type":           doc.get("event_type", ""),
             "address":              doc.get("address", ""),
-            "latitude":             doc.get("latitude"),
-            "longitude":            doc.get("longitude"),
+            "latitude":             lat,
+            "longitude":            lon,
+            "neighborhood_name":    neighborhood,   # ← NEW: for cross-dataset analysis
             "_silver_processed_at": doc.get("_silver_processed_at"),
             "_gold_loaded_at":      now,
         }
@@ -323,7 +356,7 @@ def gold_fact_911(**context) -> dict:
     return {"processed": processed}
 
 
-# ─── Task 5: Gold — agg_911_by_hour_day ──────────────────────────────────────
+# ─── Task 3: Gold — agg_911_by_hour_day ──────────────────────────────────────
 
 def gold_agg_911(**context) -> dict:
     """Pre-computes 911 call volume by hour × day-of-week (full rebuild each run)."""
@@ -334,7 +367,7 @@ def gold_agg_911(**context) -> dict:
         {"$match": {"call_datetime": {"$ne": None}}},
         {"$addFields": {
             "hour":        {"$hour": "$call_datetime"},
-            "day_of_week": {"$dayOfWeek": "$call_datetime"},   # 1=Sun … 7=Sat
+            "day_of_week": {"$dayOfWeek": "$call_datetime"},   # 1=Sun … 7=Sat (MongoDB convention)
         }},
         {"$group": {
             "_id":        {"hour": "$hour", "day_of_week": "$day_of_week"},
@@ -366,12 +399,12 @@ default_args = {
 
 with DAG(
     dag_id="seattle_911_pipeline",
-    description="End-to-end 911 pipeline: Bronze → Silver → Gold",
+    description="End-to-end 911 pipeline: Bronze → Silver → Gold (with neighborhood enrichment)",
     default_args=default_args,
     schedule_interval="*/5 * * * *",
     start_date=datetime(2026, 4, 1),
     catchup=False,
-    tags=["pipeline", "911", "bronze", "silver", "gold"],
+    tags=["pipeline", "911", "silver", "gold"],
     max_active_runs=1,
 ) as dag:
 
@@ -383,7 +416,7 @@ with DAG(
     t_fact = PythonOperator(
         task_id="gold_fact_911_calls",
         python_callable=gold_fact_911,
-        doc_md="Build gold.fact_911_calls — incremental fact table",
+        doc_md="Build gold.fact_911_calls — incremental fact table with neighborhood enrichment",
     )
     t_agg = PythonOperator(
         task_id="gold_agg_911_by_hour_day",

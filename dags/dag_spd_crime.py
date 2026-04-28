@@ -4,30 +4,30 @@ SPD Crime Pipeline — End-to-End  (Socrata API → Bronze → Silver → Gold)
 Full medallion pipeline for Seattle Police Department Crime data source.
 
 Flow:
-  bronze_ingest_crime
-      ↓
-  silver_transform_crime
+  silver_transform_crime                          (Task 1)
       ↓  [parallel]
-  gold_dim_time ─────────┐
-  gold_dim_location ─────┤
-  gold_dim_offense ──────┘
+  gold_dim_location ─────┐
+  gold_dim_offense  ─────┤
+  gold_dim_neighborhood ─┘                        (Task 2a/b/c)
       ↓  [all done]
-  gold_fact_crime_events
+  gold_fact_crime_events                          (Task 3)
       ↓  [parallel]
-  gold_agg_crime_by_neighborhood ─┐
-  gold_agg_crime_by_category ─────┤
-  gold_agg_crime_per_capita ──────┘
+  gold_agg_crime_by_category ──────────────────┐
+  gold_agg_crime_per_capita ───────────────────┤  (Task 4a/b/c/d)
+  gold_agg_crime_trend_monthly ────────────────┤
+  gold_agg_neighborhood_safety_profile ─────────┘
 
-Bronze:  Socrata API (tazs-3rd5) → MongoDB bronze.spd_crime
+Bronze:  Kafka consumer_bronze.py (Docker service) → MongoDB bronze.spd_crime
 Silver:  bronze.spd_crime → silver.silver_crime_clean
-Gold:    silver.silver_crime_clean → gold.dim_time, gold.dim_location,
-                                      gold.dim_offense, gold.fact_crime_events,
-                                      aggregations
-
-Note: gold_dim_time upserts are idempotent — safe to run concurrently with
-      seattle_911_pipeline which also upserts into gold.dim_time.
-Note: gold_agg_crime_per_capita joins with gold.dim_demographics which is
-      built by seattle_population_pipeline (trigger that pipeline first).
+Gold:    silver.silver_crime_clean →
+           gold.dim_location          — unique precinct/sector/beat/neighborhood combos
+           gold.dim_offense           — NIBRS offense taxonomy
+           gold.dim_neighborhood      — neighborhood hub (links crime + 911 + population)
+           gold.fact_crime_events     — 1 row per offense
+           gold.agg_crime_by_offense_category  — crime × category × month
+           gold.agg_crime_per_capita           — crime rate per 10K population
+           gold.agg_crime_trend_monthly        — crime trend by neighborhood × month
+           gold.agg_neighborhood_safety_profile — composite safety score per neighborhood
 
 Schedule: every 60 minutes (incremental watermark-based load)
 """
@@ -66,66 +66,116 @@ SOURCE_CFG = {
     "initial_start_date": "2024-01-01T00:00:00",
 }
 
-# Neighborhood name mapping: SPD UPPERCASE → ACS Title Case
-CRIME_TO_POP: dict[str, str] = {
-    "ALASKA JUNCTION":                    "West Seattle Junction",
-    "ALKI":                               "Alki/Admiral",
-    "BALLARD NORTH":                      "Ballard",
-    "BALLARD SOUTH":                      "Ballard",
-    "BELLTOWN":                           "Belltown",
-    "BITTERLAKE":                         "Bitter Lake",
-    "BRIGHTON/DUNLAP":                    "Columbia City",
-    "CAPITOL HILL":                       "Capitol Hill",
-    "CENTRAL AREA/SQUIRE PARK":           "Central Area/Squire Park",
-    "CHINATOWN/INTERNATIONAL DISTRICT":   "Pioneer Square/International District",
-    "CLAREMONT/RAINIER VISTA":            "Rainier Beach",
-    "COLUMBIA CITY":                      "Columbia City",
-    "COMMERCIAL DUWAMISH":                "Duwamish/SODO",
-    "COMMERCIAL HARBOR ISLAND":           "Duwamish/SODO",
-    "DOWNTOWN COMMERCIAL":                "Downtown Commercial Core",
-    "EASTLAKE - EAST":                    "Eastlake",
-    "EASTLAKE - WEST":                    "Eastlake",
-    "FAUNTLEROY SW":                      "Fauntleroy/Seaview",
-    "FIRST HILL":                         "First Hill",
-    "FREMONT":                            "Fremont",
-    "GENESEE":                            "West Seattle Junction/Genesee Hill",
-    "GEORGETOWN":                         "Georgetown",
-    "GREENWOOD":                          "Greenwood",
-    "HIGH POINT":                         "High Point",
-    "HIGHLAND PARK":                      "Highland Park",
-    "HILLMAN CITY":                       "Columbia City",
-    "JUDKINS PARK/NORTH BEACON HILL":     "Judkins Park",
-    "LAKECITY":                           "Lake City",
-    "LAKEWOOD/SEWARD PARK":               "Seward Park",
-    "MADISON PARK":                       "Madison Park",
-    "MADRONA/LESCHI":                     "Madrona/Leschi",
-    "MAGNOLIA":                           "Magnolia",
-    "MID BEACON HILL":                    "Beacon Hill",
-    "MILLER PARK":                        "Miller Park",
-    "MONTLAKE/PORTAGE BAY":               "Montlake/Portage Bay",
-    "MORGAN":                             "Morgan Junction",
-    "MOUNT BAKER":                        "Mt Baker",
-    "NEW HOLLY":                          "South Beacon Hill/NewHolly",
-    "NORTH ADMIRAL":                      "Admiral",
-    "NORTH BEACON HILL":                  "North Beacon Hill",
-    "NORTH DELRIDGE":                     "North Delridge",
-    "NORTHGATE":                          "Northgate",
-    "PHINNEY RIDGE":                      "Greenwood/Phinney Ridge",
-    "PIGEON POINT":                       "North Delridge",
-    "PIONEER SQUARE":                     "Pioneer Square/International District",
-    "QUEEN ANNE":                         "Queen Anne",
-    "RAINIER BEACH":                      "Rainier Beach",
-    "RAINIER VIEW":                       "Rainier Beach",
-    "ROOSEVELT/RAVENNA":                  "Roosevelt",
-    "ROXHILL/WESTWOOD/ARBOR HEIGHTS":     "Roxhill/Westwood",
-    "SANDPOINT":                          "Laurelhurst/Sand Point",
-    "SLU/CASCADE":                        "South Lake Union",
-    "SODO":                               "Duwamish/SODO",
-    "SOUTH BEACON HILL":                  "South Beacon Hill/NewHolly",
-    "SOUTH DELRIDGE":                     "North Delridge",
-    "SOUTH PARK":                         "South Park",
-    "UNIVERSITY":                         "University District",
-    "WALLINGFORD":                        "Wallingford",
+# Neighborhood name mapping: SPD UPPERCASE → list of ACS Title Case neighborhoods
+# Many-to-many: one SPD area can contribute to multiple ACS neighborhoods
+# (e.g., DOWNTOWN COMMERCIAL covers both Downtown and Downtown Commercial Core)
+CRIME_TO_POP: dict[str, list[str]] = {
+    "ALASKA JUNCTION":                    ["West Seattle Junction"],
+    "ALKI":                               ["Alki/Admiral"],
+    "BALLARD NORTH":                      ["Ballard", "Ballard-Interbay-Northend", "Sunset Hill/Loyal Heights", "Whittier Heights"],
+    "BALLARD SOUTH":                      ["Ballard", "Ballard-Interbay-Northend"],
+    "BELLTOWN":                           ["Belltown"],
+    "BITTERLAKE":                         ["Bitter Lake", "Broadview/Bitter Lake", "Haller Lake", "Licton Springs"],
+    "BRIGHTON/DUNLAP":                    ["Columbia City", "Graham"],
+    "CAPITOL HILL":                       ["Capitol Hill", "First Hill/Capitol Hill", "North Capitol Hill"],
+    "CENTRAL AREA/SQUIRE PARK":           ["Central Area/Squire Park", "Central District", "Central District South"],
+    "CHINATOWN/INTERNATIONAL DISTRICT":   ["Pioneer Square/International District"],
+    "CLAREMONT/RAINIER VISTA":            ["Rainier Beach", "Othello"],
+    "COLUMBIA CITY":                      ["Columbia City"],
+    "COMMERCIAL DUWAMISH":                ["Duwamish/SODO", "Greater Duwamish"],
+    "COMMERCIAL HARBOR ISLAND":           ["Duwamish/SODO", "Greater Duwamish"],
+    "DOWNTOWN COMMERCIAL":                ["Downtown Commercial Core", "Downtown"],
+    "EASTLAKE - EAST":                    ["Eastlake", "Cascade/Eastlake"],
+    "EASTLAKE - WEST":                    ["Eastlake", "Cascade/Eastlake"],
+    "FAUNTLEROY SW":                      ["Fauntleroy/Seaview"],
+    "FIRST HILL":                         ["First Hill", "First Hill/Capitol Hill"],
+    "FREMONT":                            ["Fremont"],
+    "GENESEE":                            ["West Seattle Junction/Genesee Hill"],
+    "GEORGETOWN":                         ["Georgetown", "Riverview"],
+    "GREENWOOD":                          ["Greenwood", "Crown Hill"],
+    "HIGH POINT":                         ["High Point"],
+    "HIGHLAND PARK":                      ["Highland Park", "Westwood-Highland Park"],
+    "HILLMAN CITY":                       ["Columbia City", "Graham"],
+    "JUDKINS PARK/NORTH BEACON HILL":     ["Judkins Park", "North Beacon Hill/Jefferson Park"],
+    "LAKECITY":                           ["Lake City", "Olympic Hills/Victory Heights", "Cedar Park/Meadowbrook", "Pinehurst-Haller Lake"],
+    "LAKEWOOD/SEWARD PARK":               ["Seward Park"],
+    "MADISON PARK":                       ["Madison Park"],
+    "MADRONA/LESCHI":                     ["Madrona/Leschi"],
+    "MAGNOLIA":                           ["Magnolia", "Interbay"],
+    "MID BEACON HILL":                    ["Beacon Hill"],
+    "MILLER PARK":                        ["Miller Park", "Madison-Miller"],
+    "MONTLAKE/PORTAGE BAY":               ["Montlake/Portage Bay"],
+    "MORGAN":                             ["Morgan Junction"],
+    "MOUNT BAKER":                        ["Mt Baker", "Mt. Baker/North Rainier"],
+    "NEW HOLLY":                          ["South Beacon Hill/NewHolly"],
+    "NORTH ADMIRAL":                      ["Admiral"],
+    "NORTH BEACON HILL":                  ["North Beacon Hill", "North Beacon Hill/Jefferson Park"],
+    "NORTH DELRIDGE":                     ["North Delridge"],
+    "NORTHGATE":                          ["Northgate", "Northgate/Maple Leaf", "Haller Lake"],
+    "PHINNEY RIDGE":                      ["Greenwood/Phinney Ridge", "Aurora-Licton Springs"],
+    "PIGEON POINT":                       ["North Delridge"],
+    "PIONEER SQUARE":                     ["Pioneer Square/International District"],
+    "QUEEN ANNE":                         ["Queen Anne", "Uptown"],
+    "RAINIER BEACH":                      ["Rainier Beach", "Othello"],
+    "RAINIER VIEW":                       ["Rainier Beach"],
+    "ROOSEVELT/RAVENNA":                  ["Roosevelt", "Ravenna/Bryant"],
+    "ROXHILL/WESTWOOD/ARBOR HEIGHTS":     ["Roxhill/Westwood", "Arbor Heights"],
+    "SANDPOINT":                          ["Laurelhurst/Sand Point", "Wedgwood/View Ridge"],
+    "SLU/CASCADE":                        ["South Lake Union", "Cascade/Eastlake"],
+    "SODO":                               ["Duwamish/SODO", "Greater Duwamish"],
+    "SOUTH BEACON HILL":                  ["South Beacon Hill/NewHolly"],
+    "SOUTH DELRIDGE":                     ["North Delridge"],
+    "SOUTH PARK":                         ["South Park", "Riverview"],
+    "UNIVERSITY":                         ["University District"],
+    "WALLINGFORD":                        ["Wallingford", "Green Lake"],
+}
+
+# Fallback lat/lon centroids for ACS neighborhoods that cannot be derived from dim_location.
+# Used when no SPD neighborhood in CRIME_TO_POP maps to this ACS area (e.g. Council Districts).
+KNOWN_CENTROIDS: dict[str, tuple] = {
+    # Administrative districts (Council Districts — no SPD boundary match)
+    "Council District 1":           (47.680, -122.353),
+    "Council District 2":           (47.550, -122.270),
+    "Council District 3":           (47.618, -122.308),
+    "Council District 4":           (47.670, -122.303),
+    "Council District 5":           (47.720, -122.330),
+    "Council District 6":           (47.672, -122.383),
+    "Council District 7":           (47.611, -122.342),
+    "Outside Centers":              (47.580, -122.340),
+    # Real neighborhoods with no direct SPD name match
+    "Pinehurst-Haller Lake":        (47.727, -122.319),
+    "Aurora-Licton Springs":        (47.709, -122.336),
+    "Downtown":                     (47.605, -122.334),
+    "Othello":                      (47.543, -122.279),
+    "Crown Hill":                   (47.693, -122.374),
+    "Madison-Miller":               (47.622, -122.301),
+    "First Hill/Capitol Hill":      (47.614, -122.318),
+    "Central District South":       (47.598, -122.297),
+    "Central District":             (47.608, -122.299),
+    "Graham":                       (47.533, -122.278),
+    "Westwood-Highland Park":       (47.529, -122.367),
+    "Green Lake":                   (47.681, -122.332),
+    "Greater Duwamish":             (47.566, -122.345),
+    "Uptown":                       (47.624, -122.352),
+    "Ballard-Interbay-Northend":    (47.667, -122.382),
+    "Olympic Hills/Victory Heights":(47.722, -122.310),
+    "Haller Lake":                  (47.715, -122.332),
+    "Mt. Baker/North Rainier":      (47.576, -122.290),
+    "Interbay":                     (47.645, -122.374),
+    "Arbor Heights":                (47.519, -122.383),
+    "Wedgwood/View Ridge":          (47.685, -122.296),
+    "Sunset Hill/Loyal Heights":    (47.691, -122.396),
+    "Cascade/Eastlake":             (47.634, -122.326),
+    "Ravenna/Bryant":               (47.673, -122.310),
+    "Northgate/Maple Leaf":         (47.698, -122.322),
+    "Cedar Park/Meadowbrook":       (47.714, -122.296),
+    "Whittier Heights":             (47.687, -122.374),
+    "North Beacon Hill/Jefferson Park": (47.571, -122.303),
+    "North Capitol Hill":           (47.626, -122.315),
+    "Broadview/Bitter Lake":        (47.724, -122.349),
+    "North Beach/Blue Ridge":       (47.738, -122.378),
+    "Riverview":                    (47.527, -122.364),
+    "Licton Springs":               (47.705, -122.334),
 }
 
 
@@ -538,6 +588,8 @@ def gold_fact_crime(**context) -> dict:
             "location_id":          location_id,
             "offense_dim_id":       offense_dim_id,
             "report_date_time":     report_dt,
+            "year":                 report_dt.year  if isinstance(report_dt, datetime) else None,
+            "month":                report_dt.month if isinstance(report_dt, datetime) else None,
             "offense_category":     doc.get("offense_category", ""),
             "neighborhood":         doc.get("neighborhood", ""),
             "is_shooting":          doc.get("is_shooting", False),
@@ -621,11 +673,11 @@ def gold_agg_crime_per_capita(**context) -> dict:
         hood = doc.get("neighborhood", "")
         crime_counts_raw[hood] = crime_counts_raw.get(hood, 0) + 1
 
-    # Map SPD names → ACS names
+    # Map SPD names → ACS names (many-to-many: one SPD can map to multiple ACS)
     crime_counts_by_pop: dict[str, int] = {}
     for crime_hood, count in crime_counts_raw.items():
-        pop_hood = CRIME_TO_POP.get(crime_hood)
-        if pop_hood:
+        acs_names = CRIME_TO_POP.get(crime_hood, [])
+        for pop_hood in acs_names:
             crime_counts_by_pop[pop_hood] = crime_counts_by_pop.get(pop_hood, 0) + count
 
     ops = []
@@ -658,6 +710,376 @@ def gold_agg_crime_per_capita(**context) -> dict:
     return {"agg_crime_per_capita": count}
 
 
+# ─── Task 2c: Gold — dim_neighborhood ────────────────────────────────────────
+
+def gold_dim_neighborhood(**context) -> dict:
+    """
+    Builds gold.dim_neighborhood — the central hub linking all 3 datasets.
+
+    Sources:
+      - crime neighborhoods (from silver_crime_clean, mapped via CRIME_TO_POP)
+      - ACS demographics (from dim_demographics — name + population stats)
+      - Representative lat/lon centroid from dim_location
+
+    Result: 1 row per ACS neighborhood with crime + population metadata
+    for cross-dataset analytics (crime rate, 911 rate, demographics).
+    """
+    client    = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    db_silver = client[SILVER_DB]
+    db_gold   = client[GOLD_DB]
+    coll      = db_gold["dim_neighborhood"]
+    coll.create_index("neighborhood_name", unique=True, background=True)
+
+    # Step 1: Build centroid lookup: ACS neighborhood_name → avg (lat, lon) from dim_location
+    # First build reverse map: ACS name → list of SPD names (many-to-many)
+    acs_to_spd: dict[str, list[str]] = {}
+    for spd_name, acs_names in CRIME_TO_POP.items():
+        for acs_name in acs_names:
+            acs_to_spd.setdefault(acs_name, []).append(spd_name)
+
+    # Collect lat/lon per SPD neighborhood from dim_location
+    spd_centroids: dict[str, list[tuple]] = {}
+    for loc in db_gold["dim_location"].find(
+        {"latitude": {"$ne": None}, "longitude": {"$ne": None}},
+        {"neighborhood": 1, "latitude": 1, "longitude": 1},
+    ):
+        hood = loc.get("neighborhood", "")
+        if hood:
+            spd_centroids.setdefault(hood, []).append(
+                (loc["latitude"], loc["longitude"])
+            )
+
+    def _acs_centroid(acs_name: str):
+        """Average lat/lon across all SPD neighborhoods mapping to this ACS area.
+        Falls back to KNOWN_CENTROIDS for administrative areas with no SPD match."""
+        spd_names = acs_to_spd.get(acs_name, [])
+        lats, lons = [], []
+        for spd in spd_names:
+            for lat, lon in spd_centroids.get(spd, []):
+                lats.append(lat)
+                lons.append(lon)
+        if lats:
+            return round(sum(lats) / len(lats), 6), round(sum(lons) / len(lons), 6)
+        # Fallback: use hardcoded centroid if available
+        if acs_name in KNOWN_CENTROIDS:
+            return KNOWN_CENTROIDS[acs_name]
+        return None, None
+
+    # Step 2: Iterate dim_demographics (one row per ACS neighborhood)
+    ops = []
+    count = 0
+    for demo in db_gold["dim_demographics"].find({}):
+        acs_name = demo.get("neighborhood_name", "")
+        if not acs_name:
+            continue
+        lat, lon = _acs_centroid(acs_name)
+        neighborhood_doc = {
+            "neighborhood_name":      acs_name,
+            "acs_year":               demo.get("acs_year"),
+            "total_population":       demo.get("total_population"),
+            "median_age":             demo.get("median_age"),
+            "median_household_income":demo.get("median_household_income"),
+            "poverty_pct":            demo.get("poverty_pct"),
+            "white_pct":              demo.get("white_pct"),
+            "black_pct":              demo.get("black_pct"),
+            "hispanic_pct":           demo.get("hispanic_pct"),
+            "total_housing_units":    demo.get("total_housing_units"),
+            "lat":                    lat,    # centroid latitude
+            "lon":                    lon,    # centroid longitude
+            "_updated_at":            datetime.now(timezone.utc),
+        }
+        ops.append(UpdateOne(
+            {"neighborhood_name": acs_name},
+            {"$set": neighborhood_doc},
+            upsert=True,
+        ))
+        count += 1
+        if len(ops) >= 500:
+            db_gold["dim_neighborhood"].bulk_write(ops, ordered=False)
+            ops = []
+
+    if ops:
+        db_gold["dim_neighborhood"].bulk_write(ops, ordered=False)
+
+    log.info("[Gold] dim_neighborhood: %d neighborhoods", count)
+    client.close()
+    return {"dim_neighborhood": count}
+
+
+# ─── Task 4c: Gold — agg_crime_trend_monthly ─────────────────────────────────
+
+def gold_agg_crime_trend_monthly(**context) -> dict:
+    """
+    Pre-computes crime count by neighborhood × category × month.
+    Uses CRIME_TO_POP mapping to align SPD neighborhood names with ACS names.
+    Result enables: trend lines per area, compare areas over time.
+    """
+    client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    db_gold = client[GOLD_DB]
+
+    pipeline = [
+        {"$match": {
+            "neighborhood":     {"$ne": ""},
+            "report_date_time": {"$ne": None},
+            "offense_category": {"$ne": ""},
+        }},
+        {"$addFields": {
+            "year":  {"$year":  "$report_date_time"},
+            "month": {"$month": "$report_date_time"},
+        }},
+        {"$group": {
+            "_id": {
+                "neighborhood":     "$neighborhood",
+                "offense_category": "$offense_category",
+                "year":             "$year",
+                "month":            "$month",
+            },
+            "crime_count":    {"$sum": 1},
+            "shooting_count": {"$sum": {"$cond": ["$is_shooting", 1, 0]}},
+        }},
+        {"$project": {
+            "_id":              0,
+            "neighborhood":     "$_id.neighborhood",
+            "offense_category": "$_id.offense_category",
+            "year":             "$_id.year",
+            "month":            "$_id.month",
+            "crime_count":      1,
+            "shooting_count":   1,
+        }},
+        {"$out": "agg_crime_trend_monthly"},
+    ]
+    db_gold["fact_crime_events"].aggregate(pipeline)
+    count = db_gold["agg_crime_trend_monthly"].count_documents({})
+    log.info("[Gold] agg_crime_trend_monthly: %d rows", count)
+    client.close()
+    return {"agg_crime_trend_monthly": count}
+
+
+# ─── Task 4d: Gold — agg_neighborhood_safety_profile ─────────────────────────
+
+def gold_agg_neighborhood_safety_profile(**context) -> dict:
+    """
+    Builds composite neighborhood safety profile by joining:
+      - crime counts + rates (from fact_crime_events + dim_demographics)
+      - 911 call counts + rates (from fact_911_calls — if neighborhood_name populated)
+      - demographic context (poverty, income, median_age from dim_neighborhood)
+
+    This is the PRIMARY analytics collection for cross-dataset analysis.
+    Result: 1 row per ACS neighborhood.
+    """
+    client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    db_gold = client[GOLD_DB]
+    now     = datetime.now(timezone.utc)
+
+    # ── 1. Crime counts per SPD neighborhood → map to ACS name ──
+    crime_by_spd: dict[str, dict] = {}
+    for doc in db_gold["fact_crime_events"].find(
+        {"neighborhood": {"$ne": ""}},
+        {"neighborhood": 1, "is_shooting": 1, "offense_category": 1},
+        batch_size=10_000,
+    ):
+        hood = doc.get("neighborhood", "")
+        if hood not in crime_by_spd:
+            crime_by_spd[hood] = {"total_crimes": 0, "shooting_count": 0}
+        crime_by_spd[hood]["total_crimes"] += 1
+        if doc.get("is_shooting"):
+            crime_by_spd[hood]["shooting_count"] += 1
+
+    # Aggregate to ACS names (many-to-many: one SPD can map to multiple ACS)
+    crime_by_acs: dict[str, dict] = {}
+    for spd_hood, data in crime_by_spd.items():
+        acs_names = CRIME_TO_POP.get(spd_hood, [])
+        for acs_name in acs_names:
+            if acs_name not in crime_by_acs:
+                crime_by_acs[acs_name] = {"total_crimes": 0, "shooting_count": 0}
+            crime_by_acs[acs_name]["total_crimes"]   += data["total_crimes"]
+            crime_by_acs[acs_name]["shooting_count"] += data["shooting_count"]
+
+    # ── 2. 911 calls per ACS neighborhood (from fact_911_calls.neighborhood_name) ──
+    calls_by_acs: dict[str, int] = {}
+    for doc in db_gold["fact_911_calls"].find(
+        {"neighborhood_name": {"$ne": None}},
+        {"neighborhood_name": 1},
+        batch_size=10_000,
+    ):
+        acs_name = doc.get("neighborhood_name", "")
+        if acs_name:
+            calls_by_acs[acs_name] = calls_by_acs.get(acs_name, 0) + 1
+
+    # ── 3. Merge with dim_neighborhood (demographics + centroid) ──
+    ops = []
+    for nbhd in db_gold["dim_neighborhood"].find({}):
+        acs_name = nbhd.get("neighborhood_name", "")
+        if not acs_name:
+            continue
+        pop      = nbhd.get("total_population") or 0
+        crime    = crime_by_acs.get(acs_name, {}).get("total_crimes", 0)
+        shooting = crime_by_acs.get(acs_name, {}).get("shooting_count", 0)
+        calls    = calls_by_acs.get(acs_name, 0)
+
+        crime_rate  = round(crime   / pop * 10_000, 2) if pop > 0 else None
+        calls_rate  = round(calls   / pop * 10_000, 2) if pop > 0 else None
+        shoot_rate  = round(shooting / pop * 10_000, 2) if pop > 0 else None
+
+        profile_doc = {
+            "neighborhood_name":      acs_name,
+            "total_population":       pop,
+            "median_age":             nbhd.get("median_age"),
+            "median_household_income":nbhd.get("median_household_income"),
+            "poverty_pct":            nbhd.get("poverty_pct"),
+            "white_pct":              nbhd.get("white_pct"),
+            "black_pct":              nbhd.get("black_pct"),
+            "hispanic_pct":           nbhd.get("hispanic_pct"),
+            "total_housing_units":    nbhd.get("total_housing_units"),
+            "total_crimes":           crime,
+            "shooting_incidents":     shooting,
+            "total_911_calls":        calls,
+            "crime_rate_per_10k":     crime_rate,
+            "calls_911_rate_per_10k": calls_rate,
+            "shooting_rate_per_10k":  shoot_rate,
+            "lat":                    nbhd.get("lat"),
+            "lon":                    nbhd.get("lon"),
+            "_updated_at":            now,
+        }
+        ops.append(UpdateOne(
+            {"neighborhood_name": acs_name},
+            {"$set": profile_doc},
+            upsert=True,
+        ))
+
+    if ops:
+        try:
+            db_gold["agg_neighborhood_safety_profile"].bulk_write(ops, ordered=False)
+        except BulkWriteError:
+            pass
+
+    count = db_gold["agg_neighborhood_safety_profile"].count_documents({})
+    log.info("[Gold] agg_neighborhood_safety_profile: %d neighborhoods", count)
+    client.close()
+    return {"agg_neighborhood_safety_profile": count}
+
+
+# ─── Task 4e: Gold — agg_911_per_capita ──────────────────────────────────────
+
+def gold_agg_911_per_capita(**context) -> dict:
+    """
+    Computes 911 call rate per 10K population per ACS neighborhood.
+    Uses fact_911_calls.neighborhood_name (populated via nearest-centroid enrichment
+    in the 911 pipeline after dim_neighborhood is built).
+    """
+    client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    db_gold = client[GOLD_DB]
+    now     = datetime.now(timezone.utc)
+
+    # Count 911 calls per ACS neighborhood
+    calls_by_acs: dict[str, int] = {}
+    for doc in db_gold["fact_911_calls"].find(
+        {"neighborhood_name": {"$ne": None}},
+        {"neighborhood_name": 1},
+        batch_size=10_000,
+    ):
+        name = doc.get("neighborhood_name", "")
+        if name:
+            calls_by_acs[name] = calls_by_acs.get(name, 0) + 1
+
+    ops = []
+    for demo in db_gold["dim_demographics"].find({"total_population": {"$gt": 0}}):
+        acs_name = demo.get("neighborhood_name", "")
+        pop      = demo.get("total_population", 0)
+        calls    = calls_by_acs.get(acs_name, 0)
+        rate     = round(calls / pop * 10_000, 2) if pop > 0 else None
+        ops.append(UpdateOne(
+            {"neighborhood_name": acs_name},
+            {"$set": {
+                "neighborhood_name":       acs_name,
+                "total_population":        pop,
+                "total_911_calls":         calls,
+                "calls_rate_per_10k":      rate,
+                "_updated_at":             now,
+            }},
+            upsert=True,
+        ))
+
+    if ops:
+        try:
+            db_gold["agg_911_per_capita"].bulk_write(ops, ordered=False)
+        except BulkWriteError:
+            pass
+
+    count = db_gold["agg_911_per_capita"].count_documents({})
+    log.info("[Gold] agg_911_per_capita: %d neighborhoods", count)
+    client.close()
+    return {"agg_911_per_capita": count}
+
+
+# ─── Task 4f: Fix null neighborhood_name in fact_911_calls (cold-start recovery) ───
+
+def gold_reenrich_null_neighborhoods_911(**context) -> dict:
+    """
+    Self-healing: fixes fact_911_calls records where neighborhood_name is null.
+
+    Root cause of nulls: 911 pipeline may run before dim_neighborhood is built
+    (cold-start race condition). The 911 DAG's watermark then advances and the
+    records are never re-processed by a normal 911 pipeline run.
+
+    This task runs every crime pipeline cycle — after dim_neighborhood is
+    guaranteed to exist — and updates any remaining null records in-place.
+    Idempotent: re-running has no effect once all records are enriched.
+    """
+    client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
+    db_gold = client[GOLD_DB]
+
+    # Load neighborhood centroids from dim_neighborhood
+    nbhd_coords: list[dict] = list(db_gold["dim_neighborhood"].find(
+        {"lat": {"$ne": None}, "lon": {"$ne": None}},
+        {"_id": 0, "neighborhood_name": 1, "lat": 1, "lon": 1},
+    ))
+
+    if not nbhd_coords:
+        log.warning("[reenrich-911] dim_neighborhood empty — skipping")
+        client.close()
+        return {"skipped": True, "reason": "dim_neighborhood empty"}
+
+    def _nearest(lat, lon):
+        if lat is None or lon is None:
+            return None
+        best, dist2 = None, float("inf")
+        for n in nbhd_coords:
+            d2 = (lat - n["lat"]) ** 2 + (lon - n["lon"]) ** 2
+            if d2 < dist2:
+                dist2, best = d2, n["neighborhood_name"]
+        return best
+
+    null_count = db_gold["fact_911_calls"].count_documents({"neighborhood_name": None})
+    if null_count == 0:
+        log.info("[reenrich-911] No null neighborhood_name records — nothing to do")
+        client.close()
+        return {"fixed": 0}
+
+    log.info("[reenrich-911] Found %d null neighborhood_name records — re-enriching", null_count)
+
+    ops   = []
+    fixed = 0
+    for doc in db_gold["fact_911_calls"].find(
+        {"neighborhood_name": None},
+        {"_id": 1, "latitude": 1, "longitude": 1},
+        batch_size=2_000,
+    ):
+        name = _nearest(doc.get("latitude"), doc.get("longitude"))
+        if name:
+            ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": {"neighborhood_name": name}}))
+            fixed += 1
+        if len(ops) >= 2_000:
+            db_gold["fact_911_calls"].bulk_write(ops, ordered=False)
+            ops = []
+    if ops:
+        db_gold["fact_911_calls"].bulk_write(ops, ordered=False)
+
+    log.info("[reenrich-911] Fixed %d / %d records", fixed, null_count)
+    client.close()
+    return {"fixed": fixed, "total_null": null_count}
+
+
 # ─── DAG definition ───────────────────────────────────────────────────────────
 
 default_args = {
@@ -669,12 +1091,12 @@ default_args = {
 
 with DAG(
     dag_id="spd_crime_pipeline",
-    description="End-to-end crime pipeline: Bronze → Silver → Gold",
+    description="End-to-end crime pipeline: Bronze → Silver → Gold (star schema + cross-dataset analytics)",
     default_args=default_args,
     schedule_interval="0 * * * *",   # every 60 minutes
     start_date=datetime(2026, 4, 1),
     catchup=False,
-    tags=["pipeline", "crime", "bronze", "silver", "gold"],
+    tags=["pipeline", "crime", "silver", "gold"],
     max_active_runs=1,
 ) as dag:
 
@@ -693,6 +1115,11 @@ with DAG(
         python_callable=gold_dim_offense,
         doc_md="Build gold.dim_offense from NIBRS codes in silver_crime_clean",
     )
+    t_dim_nbhd = PythonOperator(
+        task_id="gold_dim_neighborhood",
+        python_callable=gold_dim_neighborhood,
+        doc_md="Build gold.dim_neighborhood — hub linking crime + 911 + population",
+    )
     t_fact = PythonOperator(
         task_id="gold_fact_crime_events",
         python_callable=gold_fact_crime,
@@ -708,6 +1135,33 @@ with DAG(
         python_callable=gold_agg_crime_per_capita,
         doc_md="Materialise agg_crime_per_capita — joins with dim_demographics",
     )
+    t_agg_trend = PythonOperator(
+        task_id="gold_agg_crime_trend_monthly",
+        python_callable=gold_agg_crime_trend_monthly,
+        doc_md="Materialise agg_crime_trend_monthly — neighborhood × category × month",
+    )
+    t_agg_911pc = PythonOperator(
+        task_id="gold_agg_911_per_capita",
+        python_callable=gold_agg_911_per_capita,
+        doc_md="Materialise agg_911_per_capita — 911 rate per 10K per ACS neighborhood",
+    )
+    t_agg_profile = PythonOperator(
+        task_id="gold_agg_neighborhood_safety_profile",
+        python_callable=gold_agg_neighborhood_safety_profile,
+        doc_md="Materialise agg_neighborhood_safety_profile — composite cross-dataset view",
+    )
 
-    # Silver → [dim_location, dim_offense] → fact → [agg x2]
-    t_silver >> [t_dim_loc, t_dim_off] >> t_fact >> [t_agg_cat, t_agg_pc]
+    t_reenrich_911 = PythonOperator(
+        task_id="gold_reenrich_null_neighborhoods_911",
+        python_callable=gold_reenrich_null_neighborhoods_911,
+        doc_md="Fix null neighborhood_name in fact_911_calls (cold-start self-healing)",
+    )
+
+    # Silver → [dim_location, dim_offense, dim_neighborhood] → fact
+    #        → [agg_category, agg_per_capita, agg_trend]
+    # dim_neighborhood → reenrich_911 → [agg_911_pc, agg_profile]
+    # fact             → [agg_911_pc, agg_profile]  (both gates must pass)
+    t_silver >> [t_dim_loc, t_dim_off, t_dim_nbhd] >> t_fact
+    t_dim_nbhd >> t_reenrich_911
+    t_fact >> [t_agg_cat, t_agg_pc, t_agg_trend]
+    [t_fact, t_reenrich_911] >> [t_agg_911pc, t_agg_profile]

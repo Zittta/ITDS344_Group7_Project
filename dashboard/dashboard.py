@@ -1,1015 +1,651 @@
 """
-Seattle Crime Intelligence Dashboard - REBUILT FOR SCROLLING
-ITDS344 Group 7
+Seattle Public Safety Intelligence Dashboard
+ITDS344 Group 7 — Gold Layer Analytics
 """
 
 import os
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError
 from datetime import datetime
 
-# ─── Page config ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="Seattle Crime Intelligence",
+    page_title="Seattle Public Safety Intelligence",
     page_icon="🚔",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── CRITICAL: Force scrolling CSS ───────────────────────────
 st.markdown("""
 <style>
-    /* Force everything to be scrollable */
-    html, body, .stApp, section.main {
-        height: auto !important;
-        overflow: visible !important;
-    }
-    
-    /* Better scrollbar */
+    /* Allow the page to scroll naturally */
+    html { overflow: auto !important; }
+    body { overflow: auto !important; height: auto !important; }
+    /* Custom scrollbar styling */
     ::-webkit-scrollbar { width: 10px; }
     ::-webkit-scrollbar-track { background: #f0f0f0; }
     ::-webkit-scrollbar-thumb { background: #888; border-radius: 5px; }
-    ::-webkit-scrollbar-thumb:hover { background: #555; }
-    
-    /* Basic styling */
-    .main { padding: 2rem; }
     .stDataFrame { max-height: 400px; overflow: auto; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── MongoDB connection ───────────────────────────────────────
+# ─── MongoDB ──────────────────────────────────────────────────────────────────
+
 @st.cache_resource(ttl=300)
 def connect_mongo():
-    candidates = [
-        os.environ.get("MONGO_URI", ""),
-        "mongodb://mongo:27017",
-        "mongodb://localhost:27017",
-        "mongodb://127.0.0.1:27017",
-    ]
-    for uri in candidates:
+    for uri in [os.environ.get("MONGO_URI", ""), "mongodb://mongo:27017", "mongodb://localhost:27017"]:
         if not uri:
             continue
         try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=3000, maxPoolSize=10)
-            client.server_info()
-            return client, True, uri
+            c = MongoClient(uri, serverSelectionTimeoutMS=3000, maxPoolSize=10)
+            c.server_info()
+            return c, True, uri
         except:
             continue
     return None, False, None
 
 
 @st.cache_data(ttl=300)
-def load_data(collection_name):
-    client, ok, uri = connect_mongo()
+def load_gold(collection: str, query: dict = None, projection: dict = None, limit: int = 0):
+    client, ok, _ = connect_mongo()
     if not ok:
         return pd.DataFrame()
     try:
-        db = client["gold"]
-        data = list(db[collection_name].find({}, {"_id": 0}).limit(500000))
-        return pd.DataFrame(data)
-    except:
+        coll = client["gold"][collection]
+        proj = projection or {"_id": 0}
+        cur  = coll.find(query or {}, proj)
+        if limit:
+            cur = cur.limit(limit)
+        return pd.DataFrame(list(cur))
+    except Exception as e:
+        st.warning(f"Cannot load {collection}: {e}")
         return pd.DataFrame()
 
 
-# ─── Simple chart functions ───────────────────────────────────
-def simple_bar_chart(df, x_col, y_col, title=""):
+# ─── Chart helpers ────────────────────────────────────────────────────────────
+
+def bar_chart(df, x, y, title="", color="#b84c1e", horizontal=False):
     if df.empty:
         return go.Figure()
-    
-    fig = go.Figure(go.Bar(
-        x=df[x_col],
-        y=df[y_col],
-        marker=dict(color='#b84c1e')
-    ))
+    if horizontal:
+        fig = go.Figure(go.Bar(y=df[x], x=df[y], orientation="h", marker_color=color))
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    else:
+        fig = go.Figure(go.Bar(x=df[x], y=df[y], marker_color=color))
     fig.update_layout(
-        title=title,
-        height=400,
+        title=title, height=400,
         margin=dict(l=20, r=20, t=40, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
 
-def create_gauge_chart(value, title, max_value=100, suffix="%", color_ranges=None):
-    """Create a gauge chart for metrics display."""
-    if color_ranges is None:
-        color_ranges = [
-            (0, 30, "#e74c3c"),    # Red: 0-30%
-            (30, 70, "#f39c12"),   # Orange: 30-70%
-            (70, 100, "#27ae60")   # Green: 70-100%
-        ]
-    
-    # Determine color based on value
-    gauge_color = "#3498db"  # Default blue
-    for low, high, color in color_ranges:
-        if low <= value <= high:
-            gauge_color = color
-            break
-    
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        title={'text': title, 'font': {'size': 16}},
-        number={'suffix': suffix, 'font': {'size': 28}},
-        gauge={
-            'axis': {'range': [0, max_value], 'tickwidth': 1},
-            'bar': {'color': gauge_color},
-            'bgcolor': "white",
-            'borderwidth': 2,
-            'bordercolor': "gray",
-            'steps': [
-                {'range': [0, max_value], 'color': '#f0f0f0'}
-            ],
-            'threshold': {
-                'line': {'color': "red", 'width': 4},
-                'thickness': 0.75,
-                'value': max_value * 0.9
-            }
-        }
-    ))
-    
-    fig.update_layout(
-        height=280,
-        margin=dict(l=20, r=20, t=50, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        font={'color': "#444", 'family': "Arial"}
-    )
-    
-    return fig
-
-
-def create_layered_map(crime_df, calls_df, show_crime=True, show_calls=True, height=520):
-    """Create map with toggleable overlaying layers."""
-    fig = go.Figure()
-    
-    # Layer 1: 911 calls density (background)
-    if show_calls and not calls_df.empty:
-        fig.add_trace(go.Densitymapbox(
-            lat=calls_df["latitude"].values,
-            lon=calls_df["longitude"].values,
-            radius=16,
-            colorscale=[
-                [0.0,  "rgba(100,150,255,0)"],
-                [0.2,  "rgba(100,150,255,0.4)"],
-                [0.5,  "rgba(50,100,220,0.6)"],
-                [0.8,  "rgba(20,50,180,0.75)"],
-                [1.0,  "rgba(10,20,120,0.85)"],
-            ],
-            showscale=False,
-            name="911 Calls",
-            hoverinfo="skip",
-        ))
-    
-    # Layer 2: Crime by neighborhood bubbles (foreground)
-    if show_crime and not crime_df.empty:
-        fig.add_trace(go.Scattermapbox(
-            lat=crime_df["latitude"],
-            lon=crime_df["longitude"],
-            mode="markers",
-            marker=dict(
-                size=crime_df["crime_count"] / crime_df["crime_count"].max() * 50 + 10,
-                color=crime_df["crime_count"],
-                colorscale=[
-                    [0.0, "#fde725"],
-                    [0.2, "#fca636"],
-                    [0.4, "#e16462"],
-                    [0.6, "#b12a90"],
-                    [0.8, "#6a00a8"],
-                    [1.0, "#0d0887"]
-                ],
-                opacity=0.85,
-                showscale=show_crime,
-                colorbar=dict(
-                    title="Crime<br>Count",
-                    thickness=15,
-                    len=0.7,
-                    x=1.02,
-                ) if show_crime else None,
-                sizemode='diameter',
-            ),
-            text=crime_df.apply(lambda row: f"<b>{row.get('neighborhood', 'Unknown')}</b><br>{int(row['crime_count']):,} crimes", axis=1),
-            hovertemplate="%{text}<extra></extra>",
-            name="Crime by Neighborhood",
-        ))
-    
-    fig.update_layout(
-        mapbox_style="carto-positron",
-        mapbox=dict(
-            center=dict(lat=47.6062, lon=-122.3321),
-            zoom=10.5
-        ),
-        paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=height,
-        showlegend=False,
-    )
-    return fig
-
+# ─── Map helpers (from reference dashboard) ───────────────────────────────────
 
 @st.cache_data(ttl=300)
 def load_crime_by_neighborhood():
-    """Aggregate crimes by neighborhood with center coordinates."""
-    client, ok, uri = connect_mongo()
+    """Aggregate crimes by neighborhood with centroid coordinates from dim_location."""
+    client, ok, _ = connect_mongo()
     if not ok:
         return pd.DataFrame()
-    
     try:
         db = client["gold"]
-        
-        # Aggregate crimes by neighborhood with location
         pipeline = [
-            {
-                "$match": {
-                    "neighborhood": {"$exists": True, "$ne": None},
-                    "location_id": {"$exists": True, "$ne": None}
-                }
-            },
-            {
-                "$group": {
-                    "_id": {
-                        "neighborhood": "$neighborhood",
-                        "location_id": "$location_id"
-                    },
-                    "crime_count": {"$sum": 1}
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$_id.neighborhood",
-                    "crime_count": {"$sum": "$crime_count"},
-                    "sample_location": {"$first": "$_id.location_id"}
-                }
-            },
-            {"$sort": {"crime_count": -1}}
+            {"$match": {"neighborhood": {"$exists": True, "$ne": None},
+                        "location_id":  {"$exists": True, "$ne": None}}},
+            {"$group": {"_id": {"neighborhood": "$neighborhood",
+                                "location_id":  "$location_id"},
+                        "crime_count": {"$sum": 1}}},
+            {"$group": {"_id":             "$_id.neighborhood",
+                        "crime_count":     {"$sum": "$crime_count"},
+                        "sample_location": {"$first": "$_id.location_id"}}},
+            {"$sort": {"crime_count": -1}},
         ]
-        
-        neighborhood_crimes = pd.DataFrame(list(db["fact_crime_events"].aggregate(pipeline)))
-        if neighborhood_crimes.empty:
+        nbhd = pd.DataFrame(list(db["fact_crime_events"].aggregate(pipeline)))
+        if nbhd.empty:
             return pd.DataFrame()
-        
-        neighborhood_crimes = neighborhood_crimes.rename(columns={"_id": "neighborhood"})
-        
-        # Get coordinates for each neighborhood (using sample location)
-        location_ids = neighborhood_crimes["sample_location"].tolist()
-        locations = pd.DataFrame(list(db["dim_location"].find(
-            {"location_id": {"$in": location_ids}},
-            {"_id": 0, "location_id": 1, "latitude": 1, "longitude": 1}
+        nbhd = nbhd.rename(columns={"_id": "neighborhood"})
+        locs = pd.DataFrame(list(db["dim_location"].find(
+            {"location_id": {"$in": nbhd["sample_location"].tolist()}},
+            {"_id": 0, "location_id": 1, "latitude": 1, "longitude": 1},
         )))
-        
-        if not locations.empty:
-            # Merge to get coordinates
-            result = neighborhood_crimes.merge(
-                locations,
-                left_on="sample_location",
-                right_on="location_id",
-                how="inner"
-            )
-            result["latitude"] = pd.to_numeric(result["latitude"], errors="coerce")
-            result["longitude"] = pd.to_numeric(result["longitude"], errors="coerce")
-            result = result.dropna(subset=["latitude", "longitude"])
-            result = result[
-                result["latitude"].between(47.0, 48.2) &
-                result["longitude"].between(-122.8, -121.8)
-            ]
-            return result[["neighborhood", "crime_count", "latitude", "longitude"]]
-        
-        return pd.DataFrame()
+        if locs.empty:
+            return pd.DataFrame()
+        result = nbhd.merge(locs, left_on="sample_location", right_on="location_id", how="inner")
+        result["latitude"]  = pd.to_numeric(result["latitude"],  errors="coerce")
+        result["longitude"] = pd.to_numeric(result["longitude"], errors="coerce")
+        result = result.dropna(subset=["latitude", "longitude"])
+        result = result[result["latitude"].between(47.0, 48.2) & result["longitude"].between(-122.8, -121.8)]
+        return result[["neighborhood", "crime_count", "latitude", "longitude"]]
     except Exception as e:
         st.warning(f"Could not load neighborhood crime data: {e}")
         return pd.DataFrame()
 
 
-def heatmap_mapbox(df, lat_col="latitude", lon_col="longitude", weight_col=None, height=520):
-    """Optimized density heatmap on OpenStreetMap tiles."""
-    if df.empty:
-        return go.Figure()
-    
-    z = df[weight_col].values if weight_col and weight_col in df.columns else None
-    
-    fig = go.Figure(go.Densitymapbox(
-        lat=df[lat_col].values,
-        lon=df[lon_col].values,
-        z=z,
-        radius=16,
-        colorscale=[
-            [0.0,  "rgba(253,231,159,0)"],
-            [0.2,  "rgba(253,180,98,0.55)"],
-            [0.5,  "rgba(220,60,40,0.80)"],
-            [0.8,  "rgba(150,0,30,0.90)"],
-            [1.0,  "rgba(80,0,20,1.0)"],
-        ],
-        showscale=False,
-    ))
-    fig.update_layout(
-        mapbox_style="open-street-map",
-        mapbox=dict(center=dict(lat=47.6062, lon=-122.3321), zoom=11),
-        paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=height,
-    )
-    return fig
-
-
 @st.cache_data(ttl=300)
-def load_crime_geo(limit=500):
-    """Load top crime hotspots - optimized for performance."""
-    client, ok, uri = connect_mongo()
+def load_calls_geo(limit: int = 3000):
+    """Load sample 911 call lat/lon for density heatmap layer."""
+    client, ok, _ = connect_mongo()
     if not ok:
         return pd.DataFrame()
-    
-    try:
-        db = client["gold"]
-        
-        # Step 1: Get top N locations by crime count
-        pipeline = [
-            {"$match": {"location_id": {"$exists": True, "$ne": None}}},
-            {"$group": {"_id": "$location_id", "crime_count": {"$sum": 1}}},
-            {"$sort": {"crime_count": -1}},
-            {"$limit": limit}
-        ]
-        loc_counts = pd.DataFrame(list(db["fact_crime_events"].aggregate(pipeline)))
-        if loc_counts.empty:
-            return pd.DataFrame()
-        loc_counts = loc_counts.rename(columns={"_id": "location_id"})
-        
-        # Step 2: Get lat/lon for these locations
-        location_ids = loc_counts["location_id"].tolist()
-        dim_loc = pd.DataFrame(list(db["dim_location"].find(
-            {
-                "location_id": {"$in": location_ids},
-                "latitude": {"$ne": None}, 
-                "longitude": {"$ne": None}
-            },
-            {"_id": 0, "location_id": 1, "latitude": 1, "longitude": 1},
-        )))
-        if dim_loc.empty:
-            return pd.DataFrame()
-        
-        # Step 3: Merge
-        merged = loc_counts.merge(dim_loc, on="location_id", how="inner")
-        merged["latitude"] = pd.to_numeric(merged["latitude"], errors="coerce")
-        merged["longitude"] = pd.to_numeric(merged["longitude"], errors="coerce")
-        merged = merged.dropna(subset=["latitude", "longitude"])
-        merged = merged[
-            merged["latitude"].between(47.0, 48.2) &
-            merged["longitude"].between(-122.8, -121.8)
-        ]
-        return merged
-    except Exception as e:
-        st.warning(f"Could not load crime geo: {e}")
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=300)
-def load_calls_geo(limit=3000):
-    """Load 911 call locations - optimized."""
-    client, ok, uri = connect_mongo()
-    if not ok:
-        return pd.DataFrame()
-    
     try:
         db = client["gold"]
         pipeline = [
-            {"$match": {
-                "latitude": {"$exists": True, "$ne": None},
-                "longitude": {"$exists": True, "$ne": None}
-            }},
+            {"$match": {"latitude":  {"$exists": True, "$ne": None},
+                        "longitude": {"$exists": True, "$ne": None}}},
             {"$project": {"_id": 0, "latitude": 1, "longitude": 1}},
-            {"$limit": limit}
+            {"$limit": limit},
         ]
         df = pd.DataFrame(list(db["fact_911_calls"].aggregate(pipeline)))
         if df.empty:
             return df
-        
-        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+        df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
         df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
         df = df.dropna(subset=["latitude", "longitude"])
-        df = df[(df["latitude"].between(47.0, 48.2)) & (df["longitude"].between(-122.8, -121.8))]
+        df = df[df["latitude"].between(47.0, 48.2) & df["longitude"].between(-122.8, -121.8)]
         return df
     except Exception as e:
         st.warning(f"Could not load 911 geo: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
-def load_911_heatmap_data():
-    """Load aggregated 911 call data by hour and day of week."""
-    client, ok, uri = connect_mongo()
-    if not ok:
-        return pd.DataFrame()
-    try:
-        db = client["gold"]
-        data = list(db["agg_911_by_hour_day"].find({}, {"_id": 0}))
-        return pd.DataFrame(data)
-    except:
-        return pd.DataFrame()
+def create_layered_map(crime_df, calls_df, show_crime=True, show_calls=True, height=520):
+    """2-layer map: 911 density heatmap (background) + crime neighborhood bubbles (foreground)."""
+    fig = go.Figure()
+    if show_calls and not calls_df.empty:
+        fig.add_trace(go.Densitymapbox(
+            lat=calls_df["latitude"].values,
+            lon=calls_df["longitude"].values,
+            radius=16,
+            colorscale=[
+                [0.0, "rgba(100,150,255,0)"],
+                [0.2, "rgba(100,150,255,0.4)"],
+                [0.5, "rgba(50,100,220,0.6)"],
+                [0.8, "rgba(20,50,180,0.75)"],
+                [1.0, "rgba(10,20,120,0.85)"],
+            ],
+            showscale=False, name="911 Calls", hoverinfo="skip",
+        ))
+    if show_crime and not crime_df.empty:
+        fig.add_trace(go.Scattermapbox(
+            lat=crime_df["latitude"], lon=crime_df["longitude"],
+            mode="markers",
+            marker=dict(
+                size=crime_df["crime_count"] / crime_df["crime_count"].max() * 50 + 10,
+                color=crime_df["crime_count"],
+                colorscale=[[0.0,"#fde725"],[0.2,"#fca636"],[0.4,"#e16462"],
+                            [0.6,"#b12a90"],[0.8,"#6a00a8"],[1.0,"#0d0887"]],
+                opacity=0.85, showscale=show_crime, sizemode="diameter",
+                colorbar=dict(title="Crime<br>Count", thickness=15, len=0.7, x=1.02),
+            ),
+            text=crime_df.apply(
+                lambda r: f"<b>{r.get('neighborhood','Unknown')}</b><br>{int(r['crime_count']):,} crimes",
+                axis=1),
+            hovertemplate="%{text}<extra></extra>",
+            name="Crime by Neighborhood",
+        ))
+    fig.update_layout(
+        mapbox_style="carto-positron",
+        mapbox=dict(center=dict(lat=47.6062, lon=-122.3321), zoom=10.5),
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=0, b=0), height=height, showlegend=False,
+    )
+    return fig
 
 
-@st.cache_data(ttl=300)
-def load_event_types():
-    """Load 911 event types with call counts."""
-    client, ok, uri = connect_mongo()
-    if not ok:
-        return pd.DataFrame()
-    try:
-        db = client["gold"]
-        
-        # Aggregate call counts by event type
-        pipeline = [
-            {"$group": {"_id": "$event_type", "call_count": {"$sum": 1}}},
-            {"$sort": {"call_count": -1}},
-            {"$limit": 15}
-        ]
-        data = list(db["fact_911_calls"].aggregate(pipeline))
-        df = pd.DataFrame(data)
-        if not df.empty:
-            df = df.rename(columns={"_id": "event_type"})
-        return df
-    except:
-        return pd.DataFrame()
+client, mongo_ok, mongo_uri = connect_mongo()
+
+with st.spinner("Loading gold layer data…"):
+    # Core fact tables
+    crime_raw   = load_gold("fact_crime_events", limit=500_000)
+    calls_raw   = load_gold("fact_911_calls",    limit=500_000)
+    dim_offense = load_gold("dim_offense")
+
+    # Aggregations — existing
+    offense_agg  = load_gold("agg_crime_by_offense_category")
+    heatmap_data = load_gold("agg_911_by_hour_day")
+    capita_raw   = load_gold("agg_crime_per_capita")
+
+    # NEW collections
+    safety_profile         = load_gold("agg_neighborhood_safety_profile")
+    trend_monthly          = load_gold("agg_crime_trend_monthly")
+    dim_nbhd               = load_gold("dim_neighborhood")
+    crime_by_neighborhood  = load_crime_by_neighborhood()
+    calls_geo              = load_calls_geo(limit=3000)
+
+# Filter out administrative/unmapped neighborhoods with zero data
+if not safety_profile.empty:
+    safety_profile = safety_profile[
+        safety_profile["total_crimes"].fillna(0).gt(0) |
+        safety_profile["total_911_calls"].fillna(0).gt(0)
+    ].reset_index(drop=True)
 
 
-# ─── Load data ────────────────────────────────────────────────
-with st.spinner('Loading data...'):
-    client, mongo_ok, mongo_uri = connect_mongo()
-    
-    crime_raw = load_data("fact_crime_events")
-    calls_raw = load_data("fact_911_calls")
-    offense_raw = load_data("agg_crime_by_offense_category")
-    capita_raw = load_data("agg_crime_per_capita")
-    dim_offense = load_data("dim_offense")  # For subcategory data
-    
-    # Load geo data for maps
-    crime_by_neighborhood = load_crime_by_neighborhood()
-    calls_geo = load_calls_geo(limit=3000)
-    
-    # Load new analytics data
-    heatmap_911 = load_911_heatmap_data()
-    event_types = load_event_types()
-
-
-# ─── SIDEBAR ──────────────────────────────────────────────────
+# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🚔 Seattle Crime Intelligence")
+    st.title("🚔 Seattle Safety Intelligence")
     st.caption("ITDS344 · Group 7 · Data Engineering")
-    
     st.divider()
-    
+
     st.subheader("System Status")
     if mongo_ok:
-        st.success(f"✅ MongoDB Connected")
+        st.success("✅ MongoDB Connected")
         st.caption(mongo_uri)
     else:
         st.error("❌ MongoDB Offline")
-    
+
     st.divider()
-    
     st.subheader("Data Sources")
-    st.caption("🔴 Seattle Real-Time 911")
-    st.caption("🔴 SPD Crime Reports")
-    st.caption("🔴 ACS Population")
+    st.caption("🔴 Seattle Real-Time 911 (Socrata API)")
+    st.caption("🔴 SPD Crime Reports (Socrata API)")
+    st.caption("🔴 ACS Population (Census CSV)")
+
+    st.divider()
+    st.subheader("Gold Collections")
+    gold_cols = [
+        "fact_crime_events", "fact_911_calls",
+        "dim_location", "dim_offense", "dim_neighborhood", "dim_demographics",
+        "agg_crime_by_offense_category", "agg_crime_per_capita",
+        "agg_crime_trend_monthly", "agg_911_per_capita",
+        "agg_neighborhood_safety_profile", "agg_911_by_hour_day",
+    ]
+    if mongo_ok:
+        for col in gold_cols:
+            try:
+                n = client["gold"][col].count_documents({})
+                st.caption(f"📦 {col}: {n:,}")
+            except:
+                st.caption(f"📦 {col}: –")
 
 
-# ─── MAIN DASHBOARD ───────────────────────────────────────────
-st.title("Seattle Crime Dashboard")
-st.caption(f"Real-time Crime Intelligence Platform · Last refreshed: {datetime.now().strftime('%d %b %Y %H:%M')}")
-
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+st.title("Seattle Public Safety Intelligence Dashboard")
+st.caption(f"Real-time Analytics Platform · Refreshed: {datetime.now().strftime('%d %b %Y %H:%M')}")
 st.divider()
 
-# ── Today's Dashboard ─────────────────────────────────────────
-st.subheader("📊 Dashboard")
+# ════════════════════════════════════════════════════════════
+# SECTION 1: Time-filtered KPI Summary
+# ════════════════════════════════════════════════════════════
+st.subheader("📊 Summary Dashboard")
 
-# Time period selector
 col_period, col_date = st.columns([2, 3])
 with col_period:
-    time_period = st.selectbox(
-        "Time Period",
+    time_period = st.selectbox("Time Period",
         ["Today", "Select Day", "Select Month", "Select Year", "All Time"],
-        key="dashboard_period"
-    )
+        key="dash_period")
 
-# Date picker based on selection
-selected_date = None
-selected_month = None
-selected_year = None
-
+selected_date = selected_month = selected_year = None
 with col_date:
     if time_period == "Select Day":
-        selected_date = st.date_input("Pick a date", value=pd.Timestamp.now().date(), key="day_picker")
+        selected_date = st.date_input("Pick a date", value=pd.Timestamp.now().date())
     elif time_period == "Select Month":
-        col_m, col_y = st.columns(2)
-        with col_m:
-            selected_month = st.selectbox("Month", range(1, 13), index=pd.Timestamp.now().month - 1, 
-                                         format_func=lambda x: pd.Timestamp(2024, x, 1).strftime("%B"), key="month_picker")
-        with col_y:
-            selected_year = st.number_input("Year", min_value=2020, max_value=2026, value=2024, key="month_year_picker")
+        c1, c2 = st.columns(2)
+        with c1: selected_month = st.selectbox("Month", range(1, 13),
+            index=pd.Timestamp.now().month - 1,
+            format_func=lambda x: pd.Timestamp(2024, x, 1).strftime("%B"))
+        with c2: selected_year = st.number_input("Year", 2020, 2026, 2024, key="my_year")
     elif time_period == "Select Year":
-        selected_year = st.number_input("Year", min_value=2020, max_value=2026, value=2024, key="year_picker")
-    else:
-        st.write("")  # Empty space
-
-period_label = "All Time"  # Default label ป้องกัน NameError
-# Filter data based on selection
-crime_filtered = crime_raw.copy()
-calls_filtered = calls_raw.copy()
+        selected_year = st.number_input("Year", 2020, 2026, 2024, key="sy_year")
 
 
-
-# --- Filter crimes by report_date_time เท่านั้น ไม่มี fallback ---
-if not crime_raw.empty and "report_date_time" in crime_raw.columns:
-    crime_filtered = crime_raw.copy()
-    crime_filtered["_dashboard_datetime"] = pd.to_datetime(crime_filtered["report_date_time"], errors="coerce")
-
+def _filter_df(df, dt_col):
+    if df.empty or dt_col not in df.columns:
+        return df
+    d = df.copy()
+    d["_dt"] = pd.to_datetime(d[dt_col], errors="coerce").dt.tz_localize("UTC", ambiguous="NaT", nonexistent="NaT")
     if time_period == "Today":
-        today_utc = pd.Timestamp.now(tz="UTC").date()
-        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == today_utc]
-        period_label = f"Today ({today_utc.strftime('%B %d, %Y')})"
+        today = pd.Timestamp.now(tz="UTC").date()
+        d = d[d["_dt"].dt.date == today]
     elif time_period == "Select Day" and selected_date:
-        # selected_date is naive, treat as UTC date
-        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == selected_date]
-        period_label = selected_date.strftime("%B %d, %Y")
+        d = d[d["_dt"].dt.date == selected_date]
     elif time_period == "Select Month" and selected_month and selected_year:
-        crime_filtered = crime_filtered[
-            (crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year) &
-            (crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.month == selected_month)
-        ]
-        period_label = f"{pd.Timestamp(selected_year, selected_month, 1).strftime('%B %Y')}"
+        d = d[(d["_dt"].dt.year == selected_year) & (d["_dt"].dt.month == selected_month)]
     elif time_period == "Select Year" and selected_year:
-        crime_filtered = crime_filtered[crime_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year]
-        period_label = str(selected_year)
-    else:  # All Time
-        period_label = "All Time"
-else:
-    crime_filtered = pd.DataFrame()  # ไม่มีข้อมูลหรือไม่มี field
-
-if not calls_raw.empty and "call_datetime" in calls_raw.columns:
-    calls_filtered["call_datetime_parsed"] = pd.to_datetime(calls_filtered["call_datetime"], errors="coerce")
-    
-    if time_period == "Today":
-        today = pd.Timestamp.now().date()
-        calls_filtered = calls_filtered[calls_filtered["call_datetime_parsed"].dt.date == today]
-    elif time_period == "Select Day" and selected_date:
-        calls_filtered = calls_filtered[calls_filtered["call_datetime_parsed"].dt.date == selected_date]
-    elif time_period == "Select Month" and selected_month and selected_year:
-        calls_filtered = calls_filtered[
-            (calls_filtered["call_datetime_parsed"].dt.year == selected_year) &
-            (calls_filtered["call_datetime_parsed"].dt.month == selected_month)
-        ]
-    elif time_period == "Select Year" and selected_year:
-        calls_filtered = calls_filtered[calls_filtered["call_datetime_parsed"].dt.year == selected_year]
-
-st.caption(f"📅 Showing data for: **{period_label}**")
+        d = d[d["_dt"].dt.year == selected_year]
+    return d
 
 
-# ═══ KPI CARDS ROW (4 cards in grid) ═════════════════════════
-col1, col2, col3, col4 = st.columns(4)
+crime_f = _filter_df(crime_raw, "report_date_time")
+calls_f = _filter_df(calls_raw, "call_datetime")
 
+period_labels = {
+    "Today": f"Today ({pd.Timestamp.now().date().strftime('%B %d, %Y')})",
+    "Select Day": selected_date.strftime("%B %d, %Y") if selected_date else "–",
+    "Select Month": f"{pd.Timestamp(selected_year or 2024, selected_month or 1, 1).strftime('%B %Y')}" if selected_month else "–",
+    "Select Year": str(selected_year) if selected_year else "–",
+    "All Time": "All Time",
+}
+st.caption(f"📅 Showing: **{period_labels.get(time_period, 'All Time')}**")
 
+# KPI row
+k1, k2, k3, k4 = st.columns(4)
+crime_count    = len(crime_f)
+calls_count    = len(calls_f)
+shooting_count = int(crime_f["is_shooting"].sum()) if "is_shooting" in crime_f.columns else 0
+nbhd_count     = len(safety_profile) if not safety_profile.empty else 0
 
+k1.metric("🔪 Total Crimes",       f"{crime_count:,}")
+k2.metric("📞 911 Calls",          f"{calls_count:,}")
+k3.metric("🔫 Shooting Incidents", f"{shooting_count:,}")
+k4.metric("🏘️ Neighborhoods Covered", f"{nbhd_count:,}")
 
-
-
-# --- Filter 911 Calls by call_datetime เท่านั้น ไม่มี fallback ---
-if not calls_raw.empty and "call_datetime" in calls_raw.columns:
-    calls_filtered = calls_raw.copy()
-    calls_filtered["_dashboard_datetime"] = pd.to_datetime(calls_filtered["call_datetime"], errors="coerce")
-
-    if time_period == "Today":
-        today_utc = pd.Timestamp.now(tz="UTC").date()
-        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == today_utc]
-    elif time_period == "Select Day" and selected_date:
-        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.date == selected_date]
-    elif time_period == "Select Month" and selected_month and selected_year:
-        calls_filtered = calls_filtered[
-            (calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year) &
-            (calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.month == selected_month)
-        ]
-    elif time_period == "Select Year" and selected_year:
-        calls_filtered = calls_filtered[calls_filtered["_dashboard_datetime"].dt.tz_localize("UTC", nonexistent='NaT', ambiguous='NaT').dt.year == selected_year]
-    # else: All Time (no filter)
-else:
-    calls_filtered = pd.DataFrame()  # ไม่มีข้อมูลหรือไม่มี field
-
-crime_count = len(crime_filtered)
-calls_count = len(calls_filtered)
-
-# Calculate additional metrics
-shooting_count = crime_filtered["is_shooting"].sum() if "is_shooting" in crime_filtered.columns else 0
-shooting_rate = (shooting_count / crime_count * 100) if crime_count > 0 else 0
-
-police_sent_count = calls_filtered["is_police_sent"].sum() if "is_police_sent" in calls_filtered.columns else 0
-police_response_rate = (police_sent_count / calls_count * 100) if calls_count > 0 else 0
-
-
-with col1:
-    st.metric("Total Crimes", f"{crime_count:,}")
-
-with col2:
-    st.metric("911 Calls", f"{calls_count:,}")
-
-with col3:
-    st.metric("Shooting Incidents", f"{int(shooting_count):,}")
-
-
-# View detailed data
+# Detailed records expander
 with st.expander("📋 View Detailed Records"):
     tab1, tab2 = st.tabs(["Crime Records", "911 Call Records"])
-    
     with tab1:
-        if not crime_filtered.empty:
-            # Always show report_date_time if present
-            base_cols = ["offense_id", "report_date_time", "offense_date", "offense_category", 
-                         "offense_sub_category", "neighborhood", "precinct", "is_shooting"]
-            display_cols = [c for c in base_cols if c in crime_filtered.columns]
-            if display_cols:
-                crime_display = crime_filtered[display_cols].tail(100).copy()
-                # Format datetime columns as UTC (GMT+0000)
-                if "offense_date" in crime_display.columns:
-                    crime_display["offense_date"] = pd.to_datetime(crime_display["offense_date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
-                if "report_date_time" in crime_display.columns:
-                    crime_display["report_date_time"] = pd.to_datetime(crime_display["report_date_time"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
-                st.dataframe(crime_display, use_container_width=True, height=400, hide_index=True)
-                st.caption(f"📊 Showing last 100 of {len(crime_filtered):,} total crimes")
-            else:
-                st.dataframe(crime_filtered.tail(100), use_container_width=True, height=400, hide_index=True)
+        if not crime_f.empty:
+            cols = [c for c in ["offense_id", "report_date_time", "offense_category",
+                                 "neighborhood", "is_shooting"] if c in crime_f.columns]
+            st.dataframe(crime_f[cols].tail(100), use_container_width=True, height=300, hide_index=True)
         else:
-            st.info("No crime records for the selected period")
-    
+            st.info("No crime records for selected period")
     with tab2:
-        if not calls_filtered.empty:
-            display_cols = [c for c in ["event_id", "call_datetime", "event_type", 
-                                       "address", "is_police_sent", "latitude", "longitude"]
-                           if c in calls_filtered.columns]
-            if display_cols:
-                calls_display = calls_filtered[display_cols].tail(100).copy()
-                if "call_datetime" in calls_display.columns:
-                    calls_display["call_datetime"] = pd.to_datetime(calls_display["call_datetime"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
-                st.dataframe(calls_display, use_container_width=True, height=400, hide_index=True)
-                st.caption(f"📊 Showing last 100 of {len(calls_filtered):,} total 911 calls")
-            else:
-                st.dataframe(calls_filtered.tail(100), use_container_width=True, height=400, hide_index=True)
+        if not calls_f.empty:
+            cols = [c for c in ["event_id", "call_datetime", "event_type",
+                                 "address", "neighborhood_name"] if c in calls_f.columns]
+            st.dataframe(calls_f[cols].tail(100), use_container_width=True, height=300, hide_index=True)
         else:
-            st.info("No 911 call records for the selected period")
+            st.info("No 911 call records for selected period")
 
 st.divider()
-# ── Seattle Crime Map ─────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════
+# SECTION 2: Neighborhood Safety Profile (cross-dataset)
+# ════════════════════════════════════════════════════════════
+st.subheader("🏘️ Neighborhood Safety Profile")
+st.caption("รวมข้อมูล Crime + 911 + Population per Neighborhood — ใช้ประเมินความเสี่ยงแต่ละพื้นที่")
+
+if not safety_profile.empty:
+    top_n = st.slider("จำนวน Neighborhoods", 5, 30, 15, key="profile_n")
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("**🔴 Crime Rate per 10,000 Population**")
+        if "crime_rate_per_10k" in safety_profile.columns:
+            top_crime = (safety_profile
+                .dropna(subset=["crime_rate_per_10k"])
+                .nlargest(top_n, "crime_rate_per_10k")
+                [["neighborhood_name", "crime_rate_per_10k"]])
+            st.plotly_chart(
+                bar_chart(top_crime, "neighborhood_name", "crime_rate_per_10k",
+                          color="#e74c3c", horizontal=True),
+                use_container_width=True, key="crime_rate_chart"
+            )
+
+    with col_b:
+        st.markdown("**📞 911 Call Rate per 10,000 Population**")
+        if "calls_911_rate_per_10k" in safety_profile.columns:
+            top_calls = (safety_profile
+                .dropna(subset=["calls_911_rate_per_10k"])
+                .nlargest(top_n, "calls_911_rate_per_10k")
+                [["neighborhood_name", "calls_911_rate_per_10k"]])
+            st.plotly_chart(
+                bar_chart(top_calls, "neighborhood_name", "calls_911_rate_per_10k",
+                          color="#3498db", horizontal=True),
+                use_container_width=True, key="calls_rate_chart"
+            )
+
+    # Scatter: Crime Rate vs Poverty
+    st.markdown("**📊 Crime Rate vs Poverty % (Demographic Correlation)**")
+    scatter_cols = ["neighborhood_name", "crime_rate_per_10k", "poverty_pct",
+                    "total_population", "median_household_income"]
+    scatter_df = safety_profile.dropna(subset=["crime_rate_per_10k", "poverty_pct"])
+    if not scatter_df.empty:
+        fig_scatter = px.scatter(
+            scatter_df,
+            x="poverty_pct", y="crime_rate_per_10k",
+            size="total_population", color="crime_rate_per_10k",
+            hover_name="neighborhood_name",
+            hover_data={"median_household_income": True, "total_population": ":,"},
+            color_continuous_scale="YlOrRd",
+            labels={"poverty_pct": "Poverty % (ACS)", "crime_rate_per_10k": "Crime Rate per 10K"},
+            title="Crime Rate vs Poverty Rate by Neighborhood (bubble size = population)",
+            height=450,
+        )
+        fig_scatter.update_layout(paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_scatter, use_container_width=True, key="scatter_poverty")
+
+    # Safety profile data table
+    with st.expander("📋 Full Neighborhood Safety Profile Table"):
+        display_cols = [c for c in [
+            "neighborhood_name", "total_population", "total_crimes",
+            "shooting_incidents", "total_911_calls",
+            "crime_rate_per_10k", "calls_911_rate_per_10k",
+            "shooting_rate_per_10k", "poverty_pct", "median_age",
+            "median_household_income",
+        ] if c in safety_profile.columns]
+        st.dataframe(
+            safety_profile[display_cols].sort_values("crime_rate_per_10k", ascending=False),
+            use_container_width=True, height=400, hide_index=True
+        )
+else:
+    st.info("ยังไม่มีข้อมูล agg_neighborhood_safety_profile — รัน spd_crime_pipeline ก่อน")
+
+st.divider()
+
+# ════════════════════════════════════════════════════════════
+# SECTION 3: Top Neighborhoods (Crime Rate & 911 Rate)
+# ════════════════════════════════════════════════════════════
+st.subheader("🏙️ Seattle Safety — Top Risk Neighborhoods")
+st.caption("ย่านที่มีอัตราอาชญากรรมสูงสุด 15 อันดับแรก")
+
+if not safety_profile.empty:
+    top_n2 = st.slider("จำนวน Neighborhoods", 5, 30, 15, key="topn2")
+    m1, m2 = st.columns(2)
+
+    with m1:
+        st.markdown("**🔴 Crime Rate per 10,000 Population**")
+        if "crime_rate_per_10k" in safety_profile.columns:
+            tc = (safety_profile.dropna(subset=["crime_rate_per_10k"])
+                  .nlargest(top_n2, "crime_rate_per_10k")
+                  [["neighborhood_name", "crime_rate_per_10k"]])
+            st.plotly_chart(
+                bar_chart(tc, "neighborhood_name", "crime_rate_per_10k",
+                          color="#e74c3c", horizontal=True),
+                use_container_width=True, key="top_crime_bar"
+            )
+
+    with m2:
+        st.markdown("**📞 911 Call Rate per 10,000 Population**")
+        if "calls_911_rate_per_10k" in safety_profile.columns:
+            tc2 = (safety_profile.dropna(subset=["calls_911_rate_per_10k"])
+                   .nlargest(top_n2, "calls_911_rate_per_10k")
+                   [["neighborhood_name", "calls_911_rate_per_10k"]])
+            st.plotly_chart(
+                bar_chart(tc2, "neighborhood_name", "calls_911_rate_per_10k",
+                          color="#3498db", horizontal=True),
+                use_container_width=True, key="top_911_bar"
+            )
+else:
+    st.info("ยังไม่มีข้อมูล agg_neighborhood_safety_profile — รัน spd_crime_pipeline ก่อน")
+
+st.divider()
+
+# ════════════════════════════════════════════════════════════
+# SECTION 4: Crime Trend Monthly (by Neighborhood)
+# ════════════════════════════════════════════════════════════
+st.subheader("📈 Crime Trend by Neighborhood & Category")
+st.caption("ใช้วิเคราะห์แนวโน้มปัญหาในแต่ละพื้นที่ตามช่วงเวลา")
+
+if not trend_monthly.empty:
+    col_t1, col_t2 = st.columns(2)
+
+    available_nbhd = sorted(trend_monthly["neighborhood"].dropna().unique().tolist()) \
+        if "neighborhood" in trend_monthly.columns else []
+    available_cat  = sorted(trend_monthly["offense_category"].dropna().unique().tolist()) \
+        if "offense_category" in trend_monthly.columns else []
+
+    with col_t1:
+        sel_nbhd = st.multiselect("เลือก Neighborhood",
+            available_nbhd, default=available_nbhd[:3] if len(available_nbhd) >= 3 else available_nbhd,
+            key="trend_nbhd")
+    with col_t2:
+        sel_cat = st.multiselect("เลือก Offense Category",
+            available_cat, default=available_cat[:2] if len(available_cat) >= 2 else available_cat,
+            key="trend_cat")
+
+    trend_f = trend_monthly.copy()
+    if sel_nbhd:
+        trend_f = trend_f[trend_f["neighborhood"].isin(sel_nbhd)]
+    if sel_cat:
+        trend_f = trend_f[trend_f["offense_category"].isin(sel_cat)]
+
+    if not trend_f.empty and "year" in trend_f.columns and "month" in trend_f.columns:
+        trend_f["period"] = trend_f.apply(
+            lambda r: f"{int(r.get('year', 2024))}-{int(r.get('month', 1)):02d}", axis=1)
+        trend_agg = (trend_f.groupby(["period", "neighborhood"], as_index=False)["crime_count"].sum()
+                     .sort_values("period"))
+        fig_trend = px.line(trend_agg, x="period", y="crime_count", color="neighborhood",
+                            title="Monthly Crime Count by Neighborhood",
+                            labels={"period": "Month", "crime_count": "Crime Count"},
+                            height=400)
+        fig_trend.update_layout(paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_trend, use_container_width=True, key="trend_line")
+    else:
+        st.info("กรุณาเลือก Neighborhood และ Category")
+else:
+    st.info("ยังไม่มีข้อมูล agg_crime_trend_monthly — รัน spd_crime_pipeline ก่อน")
+
+st.divider()
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 3: Seattle Crime Map (layered)
+# ════════════════════════════════════════════════════════════
 st.subheader("🗺️ Seattle Crime Map")
 
-# Initialize session state for map toggles
-if "show_crime_layer" not in st.session_state:
-    st.session_state.show_crime_layer = True
-if "show_calls_layer" not in st.session_state:
-    st.session_state.show_calls_layer = True
-
 # Layer toggles
-col_toggle1, col_toggle2 = st.columns(2)
-with col_toggle1:
-    show_crime = st.checkbox("🔴 Crime by Neighborhood", 
-                            value=st.session_state.show_crime_layer, 
-                            key="crime_layer_toggle")
-    st.session_state.show_crime_layer = show_crime
-    
-with col_toggle2:
-    show_calls = st.checkbox("📞 911 Calls Density", 
-                            value=st.session_state.show_calls_layer, 
-                            key="calls_layer_toggle")
-    st.session_state.show_calls_layer = show_calls
+col_t1, col_t2 = st.columns(2)
+with col_t1:
+    show_crime = st.checkbox("🔴 Crime by Neighborhood",  value=True, key="crime_layer_toggle")
+with col_t2:
+    show_calls = st.checkbox("📞 911 Calls Density", value=True, key="calls_layer_toggle")
 
-# Render map with selected layers
 if crime_by_neighborhood.empty and calls_geo.empty:
-    st.warning("No map data available. Trigger `spd_crime_pipeline` in Airflow and ensure Kafka is running.")
+    st.warning("ไม่มีข้อมูลแผนที่ — ตรวจสอบว่ารัน Kafka consumer และ spd_crime_pipeline แล้ว")
 else:
     st.plotly_chart(
-        create_layered_map(crime_by_neighborhood, calls_geo, show_crime=show_crime, show_calls=show_calls, height=550),
+        create_layered_map(crime_by_neighborhood, calls_geo,
+                           show_crime=show_crime, show_calls=show_calls, height=550),
         use_container_width=True,
         config={"displayModeBar": False, "scrollZoom": True},
         key="layered_crime_map"
     )
-    
-    # Build caption
     caption_parts = []
     if show_crime and not crime_by_neighborhood.empty:
-        total_crimes = int(crime_by_neighborhood["crime_count"].sum())
-        caption_parts.append(f"🔴 {len(crime_by_neighborhood):,} neighborhoods · {total_crimes:,} crimes")
+        caption_parts.append(f"🔴 {len(crime_by_neighborhood):,} neighborhoods · {int(crime_by_neighborhood['crime_count'].sum()):,} crimes")
     if show_calls and not calls_geo.empty:
         caption_parts.append(f"📞 {len(calls_geo):,} 911 call locations")
-    
     if caption_parts:
         st.caption(" | ".join(caption_parts))
 
-st.divider()
+col_l, col_r = st.columns(2)
 
-# ═══ CRIME ANALYSIS GRID (2 columns) ═════════════════════════
-col_left, col_right = st.columns(2)
-
-# ── LEFT: Crime Categories Chart ──────────────────────────────
-with col_left:
+with col_l:
     st.subheader("Crime Categories")
-    
-    # View type selector
-    view_type = st.radio(
-        "View By",
-        ["Category", "Subcategory"],
-        horizontal=True,
-        key="crime_view_type"
-    )
-    
+    view_type = st.radio("View By", ["Category", "Subcategory"], horizontal=True, key="crime_view_type")
+
     if crime_raw.empty:
-        st.warning("No crime data available. Run the pipeline first.")
-    else:
-        if view_type == "Category":
-            # Use pre-aggregated category data
-            if not offense_raw.empty and "offense_category" in offense_raw.columns:
-                if "crime_count" in offense_raw.columns:
-                    offense_raw["crime_count"] = pd.to_numeric(offense_raw["crime_count"], errors="coerce").fillna(0)
-                    offense_agg = (
-                        offense_raw.groupby("offense_category", as_index=False)["crime_count"]
-                        .sum()
-                        .sort_values("crime_count", ascending=False)
-                        .head(15)
-                    )
-                else:
-                    offense_agg = (
-                        offense_raw.groupby("offense_category", as_index=False)
-                        .size()
-                        .rename(columns={"size": "crime_count"})
-                        .sort_values("crime_count", ascending=False)
-                        .head(15)
-                    )
-                
-                if not offense_agg.empty:
-                    fig = simple_bar_chart(offense_agg, "offense_category", "crime_count", "")
-                    st.plotly_chart(fig, use_container_width=True, key="offense_chart")
-                    st.caption(f"📊 {len(offense_agg)} categories · {offense_agg['crime_count'].sum():,} crimes")
-                else:
-                    st.info("No category data available")
-            else:
-                st.warning("Category data not found")
-        
-        else:  # Subcategory
-            # Use dim_offense which has offense_sub_category
-            if not dim_offense.empty and "offense_sub_category" in dim_offense.columns:
-                # Join fact_crime_events with dim_offense to get subcategories
-                if "offense_dim_id" in crime_raw.columns and "offense_dim_id" in dim_offense.columns:
-                    # Merge to get subcategory
-                    crime_with_subcat = crime_raw.merge(
-                        dim_offense[["offense_dim_id", "offense_sub_category"]], 
-                        on="offense_dim_id", 
-                        how="left"
-                    )
-                    
-                    offense_agg = (
-                        crime_with_subcat.groupby("offense_sub_category", as_index=False)
-                        .size()
-                        .rename(columns={"size": "crime_count"})
-                        .sort_values("crime_count", ascending=False)
-                        .head(15)
-                    )
-                    
-                    if not offense_agg.empty:
-                        fig = simple_bar_chart(offense_agg, "offense_sub_category", "crime_count", "")
-                        st.plotly_chart(fig, use_container_width=True, key="offense_chart")
-                        st.caption(f"📊 {len(offense_agg)} subcategories · {offense_agg['crime_count'].sum():,} crimes")
-                    else:
-                        st.info("No subcategory data available")
-                else:
-                    st.warning("Cannot join crime data with offense dimension - missing offense_dim_id")
-            else:
-                st.warning("Subcategory data not found in dim_offense table")
-
-# ── RIGHT: Highest Risk Areas Chart ───────────────────────────
-with col_right:
-    st.subheader("Highest Risk Areas")
-    
-    # Number of top areas slider
-    top_n = st.slider("Number of neighborhoods", min_value=5, max_value=20, value=10, key="top_n_slider")
-    
-    if capita_raw.empty:
-        st.warning("No per capita data available")
-    else:
-        if "neighborhood_name" in capita_raw.columns and "crime_rate_per_10k" in capita_raw.columns:
-            capita_raw["crime_rate_per_10k"] = pd.to_numeric(capita_raw["crime_rate_per_10k"], errors="coerce").fillna(0)
-            capita_top = capita_raw.sort_values("crime_rate_per_10k", ascending=False).head(top_n)
-            
-            fig = simple_bar_chart(capita_top, "neighborhood_name", "crime_rate_per_10k", "")
-            st.plotly_chart(fig, use_container_width=True, key="risk_chart")
-            st.caption(f"📊 Top {len(capita_top)} by crime rate per 10K population")
-        else:
-            st.warning("Missing columns in capita data")
-
-st.divider()
-
-# ═══ 911 & NIBRS ANALYSIS GRID (2 columns) ═══════════════════
-col_left, col_right = st.columns(2)
-
-# ── LEFT: Top 911 Event Types ─────────────────────────────────
-with col_left:
-    st.subheader("📞 Top 911 Event Types")
-    
-    if event_types.empty:
-        st.warning("No event type data available")
-    else:
-        if "event_type" in event_types.columns and "call_count" in event_types.columns:
-            fig = simple_bar_chart(event_types, "event_type", "call_count", "")
-            st.plotly_chart(fig, use_container_width=True, key="event_types_chart")
-            st.caption(f"📊 Top {len(event_types)} types · {event_types['call_count'].sum():,} calls")
-        else:
-            st.warning("Missing columns in event type data")
-
-# ── RIGHT: NIBRS Crime Classification ─────────────────────────
-with col_right:
-    st.subheader("🔍 NIBRS Classification")
-    
-    if dim_offense.empty or crime_raw.empty:
-        st.warning("No NIBRS data available")
-    else:
-        if "offense_dim_id" in crime_raw.columns and "nibrs_group" in dim_offense.columns:
-            # Join crime data with offense dimension to get NIBRS group
-            crime_nibrs = crime_raw.merge(
-                dim_offense[["offense_dim_id", "nibrs_group", "crime_against"]], 
-                on="offense_dim_id", 
-                how="left"
-            )
-            
-            # NIBRS Group A vs B (single chart in this column)
-            if "nibrs_group" in crime_nibrs.columns:
-                nibrs_group_counts = (
-                    crime_nibrs.groupby("nibrs_group", as_index=False)
-                    .size()
-                    .rename(columns={"size": "crime_count"})
-                    .sort_values("crime_count", ascending=False)
+        st.warning("ไม่มีข้อมูล crime")
+    elif view_type == "Category":
+        if not offense_agg.empty and "offense_category" in offense_agg.columns:
+            offense_agg["crime_count"] = pd.to_numeric(
+                offense_agg.get("crime_count", 0), errors="coerce").fillna(0)
+            grp = (offense_agg.groupby("offense_category", as_index=False)["crime_count"]
+                   .sum().sort_values("crime_count", ascending=False).head(15))
+            if not grp.empty:
+                st.plotly_chart(
+                    bar_chart(grp, "offense_category", "crime_count", color="#b84c1e"),
+                    use_container_width=True, key="offense_chart"
                 )
-                
-                if not nibrs_group_counts.empty:
-                    fig = go.Figure(data=[go.Pie(
-                        labels=nibrs_group_counts["nibrs_group"],
-                        values=nibrs_group_counts["crime_count"],
-                        hole=0.4,
-                        marker=dict(colors=["#e74c3c", "#3498db"])
-                    )])
-                    fig.update_layout(
-                        title="Group A (Serious) vs Group B",
-                        height=400,
-                        margin=dict(l=20, r=20, t=40, b=20),
-                        paper_bgcolor='rgba(0,0,0,0)',
+                st.caption(f"📊 {len(grp)} categories · {int(grp['crime_count'].sum()):,} crimes")
+        else:
+            st.warning("Category data not found")
+    else:  # Subcategory
+        if not dim_offense.empty and "offense_sub_category" in dim_offense.columns:
+            if "offense_dim_id" in crime_raw.columns and "offense_dim_id" in dim_offense.columns:
+                merged_sub = crime_raw.merge(
+                    dim_offense[["offense_dim_id", "offense_sub_category"]],
+                    on="offense_dim_id", how="left"
+                )
+                sub_grp = (merged_sub.groupby("offense_sub_category", as_index=False)
+                           .size().rename(columns={"size": "crime_count"})
+                           .sort_values("crime_count", ascending=False).head(15))
+                if not sub_grp.empty:
+                    st.plotly_chart(
+                        bar_chart(sub_grp, "offense_sub_category", "crime_count", color="#b84c1e"),
+                        use_container_width=True, key="offense_chart"
                     )
-                    st.plotly_chart(fig, use_container_width=True, key="nibrs_group_chart")
-                    st.caption("📊 Group A: Serious | Group B: Less serious")
+                    st.caption(f"📊 {len(sub_grp)} subcategories · {int(sub_grp['crime_count'].sum()):,} crimes")
+                else:
+                    st.info("No subcategory data")
+            else:
+                st.warning("Cannot join crime data — missing offense_dim_id")
+        else:
+            st.warning("Subcategory data not found in dim_offense")
 
-st.divider()
-
-# ── Additional NIBRS: Crime Against Category ──────────────────
-st.subheader("🎯 Crime Against Category Distribution")
-
-if not dim_offense.empty and not crime_raw.empty:
-    if "offense_dim_id" in crime_raw.columns and "crime_against" in dim_offense.columns:
-        crime_nibrs = crime_raw.merge(
-            dim_offense[["offense_dim_id", "crime_against"]], 
-            on="offense_dim_id", 
-            how="left"
-        )
-        
-        if "crime_against" in crime_nibrs.columns:
-            # Get all crime_against categories
-            crime_against_counts = (
-                crime_nibrs[crime_nibrs["crime_against"].notna()]
-                .groupby("crime_against", as_index=False)
-                .size()
-                .rename(columns={"size": "crime_count"})
-                .sort_values("crime_count", ascending=False)
+with col_r:
+    st.markdown("**NIBRS Crime Classification**")
+    if not dim_offense.empty and not crime_raw.empty:
+        if "offense_dim_id" in crime_raw.columns and "nibrs_group" in dim_offense.columns:
+            merged = crime_raw.merge(
+                dim_offense[["offense_dim_id", "nibrs_group", "crime_against"]],
+                on="offense_dim_id", how="left"
             )
-            
-            if not crime_against_counts.empty:
-                # Calculate total for percentages (use all crimes for accurate percentage)
-                total_count = crime_against_counts["crime_count"].sum()
-                
-                # Create a list of all categories with their data (only real data, no padding)
-                categories_data = []
-                for _, row in crime_against_counts.iterrows():
-                    categories_data.append({
-                        "category": row["crime_against"],
-                        "count": int(row["crime_count"]),
-                        "pct": row["crime_count"] / total_count * 100
-                    })
-                
-                # First row: up to 3 columns
-                col1, col2, col3 = st.columns(3)
-                
-                if len(categories_data) > 0:
-                    with col1:
-                        data = categories_data[0]
-                        st.metric(
-                            f"{data['category']} ({data['pct']:.1f}%)",
-                            f"{data['count']:,}",
-                            None
-                        )
-                
-                if len(categories_data) > 1:
-                    with col2:
-                        data = categories_data[1]
-                        st.metric(
-                            f"{data['category']} ({data['pct']:.1f}%)",
-                            f"{data['count']:,}",
-                            None
-                        )
-                
-                if len(categories_data) > 2:
-                    with col3:
-                        data = categories_data[2]
-                        st.metric(
-                            f"{data['category']} ({data['pct']:.1f}%)",
-                            f"{data['count']:,}",
-                            None
-                        )
-                
-                # Second row: up to 3 more columns (if there are more categories)
-                if len(categories_data) > 3:
-                    col4, col5, col6 = st.columns(3)
-                    
-                    with col4:
-                        data = categories_data[3]
-                        st.metric(
-                            f"{data['category']} ({data['pct']:.1f}%)",
-                            f"{data['count']:,}",
-                            None
-                        )
-                    
-                    if len(categories_data) > 4:
-                        with col5:
-                            data = categories_data[4]
-                            st.metric(
-                                f"{data['category']} ({data['pct']:.1f}%)",
-                                f"{data['count']:,}",
-                                None
-                            )
-                    
-                
-                st.caption("📊 PERSON: Against individuals | PROPERTY: Against belongings | SOCIETY: Against public order")
+            nibrs_counts = (merged.groupby("nibrs_group", as_index=False)
+                            .size().rename(columns={"size": "count"}))
+            if not nibrs_counts.empty:
+                fig_pie = go.Figure(go.Pie(
+                    labels=nibrs_counts["nibrs_group"], values=nibrs_counts["count"],
+                    hole=0.4, marker=dict(colors=["#e74c3c", "#3498db", "#95a5a6"])
+                ))
+                fig_pie.update_layout(
+                    title="NIBRS Group A (Serious) vs B",
+                    height=400, paper_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_pie, use_container_width=True, key="nibrs_pie")
 
 st.divider()
 
-# ═══ 911 DISPATCH HEATMAP (Full Width) ═══════════════════════
-st.subheader("⏰ 911 Dispatch Patterns")
+# ════════════════════════════════════════════════════════════
+# SECTION 7: 911 Dispatch Heatmap
+# ════════════════════════════════════════════════════════════
+st.subheader("⏰ 911 Dispatch Patterns (Hour × Day of Week)")
 
-if heatmap_911.empty:
-    st.warning("No heatmap data available")
+if not heatmap_data.empty and {"hour", "day_of_week", "call_count"} <= set(heatmap_data.columns):
+    pivot = heatmap_data.pivot(index="hour", columns="day_of_week", values="call_count").fillna(0)
+    day_map = {1: "Sunday", 2: "Monday", 3: "Tuesday", 4: "Wednesday",
+               5: "Thursday", 6: "Friday", 7: "Saturday"}
+    pivot.columns = [day_map.get(int(d), f"Day {d}") for d in pivot.columns]
+
+    fig_heat = go.Figure(go.Heatmap(
+        z=pivot.values, x=pivot.columns, y=pivot.index,
+        colorscale="YlOrRd", text=pivot.values,
+        texttemplate="%{text:.0f}", textfont={"size": 9},
+        colorbar=dict(title="Calls"),
+    ))
+    fig_heat.update_layout(
+        title="911 Call Volume by Hour × Day of Week",
+        xaxis_title="Day of Week", yaxis_title="Hour (0-23)",
+        height=500, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig_heat, use_container_width=True, key="heatmap_911")
+
+    peak = heatmap_data.loc[heatmap_data["call_count"].idxmax()]
+    peak_day = day_map.get(int(peak["day_of_week"]), "?")
+    st.caption(f"📊 Peak: **{peak_day} at {int(peak['hour']):02d}:00** — {int(peak['call_count']):,} calls")
 else:
-    if "hour" in heatmap_911.columns and "day_of_week" in heatmap_911.columns and "call_count" in heatmap_911.columns:
-        # Create pivot table for heatmap
-        heatmap_pivot = heatmap_911.pivot(index="hour", columns="day_of_week", values="call_count").fillna(0)
-        
-        # Map day numbers to names (handle both 0-6 and 0-7 ranges)
-        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        day_mapping = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 
-                      4: "Friday", 5: "Saturday", 6: "Sunday", 7: "Monday"}  # 7 wraps to Monday
-        heatmap_pivot.columns = [day_mapping.get(int(d), f"Day {d}") for d in heatmap_pivot.columns]
-        
-        # Create heatmap
-        fig = go.Figure(data=go.Heatmap(
-            z=heatmap_pivot.values,
-            x=heatmap_pivot.columns,
-            y=heatmap_pivot.index,
-            colorscale="YlOrRd",
-            text=heatmap_pivot.values,
-            texttemplate="%{text:.0f}",
-            textfont={"size": 10},
-            colorbar=dict(title="Calls")
-        ))
-        
-        fig.update_layout(
-            title="911 Call Volume by Hour and Day of Week",
-            xaxis_title="Day of Week",
-            yaxis_title="Hour of Day (0-23)",
-            height=600,
-            margin=dict(l=20, r=20, t=40, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-        )
-        
-        st.plotly_chart(fig, use_container_width=True, key="heatmap_911")
-        
-        # Find peak hour
-        peak_idx = heatmap_911["call_count"].idxmax()
-        if pd.notna(peak_idx):
-            peak_row = heatmap_911.loc[peak_idx]
-            peak_hour = int(peak_row["hour"])
-            peak_day = day_mapping.get(int(peak_row["day_of_week"]), "Unknown")
-            peak_count = int(peak_row["call_count"])
-            st.caption(f"📊 Peak: **{peak_day} at {peak_hour:02d}:00** with {peak_count:,} calls")
-    else:
-        st.warning("Missing required columns in heatmap data")
+    st.info("ยังไม่มีข้อมูล agg_911_by_hour_day")
 
 st.divider()
 
-# ── Footer ────────────────────────────────────────────────────
+# ─── Footer ───────────────────────────────────────────────────────────────────
 st.caption("✨ ITDS344 · Group 7 · Data Engineering · Streamlit · Kafka · Airflow · MongoDB")
-st.caption("🚀 Seattle Crime Intelligence Dashboard · Grid Layout with Performance Gauges")
-
-# Add extra space to ensure scrolling
-for i in range(3):
+for _ in range(2):
     st.write("")

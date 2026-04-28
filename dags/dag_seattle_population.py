@@ -46,6 +46,12 @@ CSV_PATH         = "/opt/airflow/data/raw_csv/seattle_neighborhoods_acs.csv"
 ACS_YEAR         = 2024
 REQUIRED_COLUMNS = {"Neighborhood Name", "Total Population"}
 
+# Neighborhoods that cannot be mapped to SPD crime data — excluded at ingest.
+# Council Districts (CD) are political boundaries, not crime-reporting areas.
+# Outside Centers / North Beach/Blue Ridge have no SPD neighborhood equivalent.
+SKIP_SUBTYPES      = {"CD"}                               # Neighborhood Type column
+SKIP_NEIGHBORHOODS = {"Outside Centers", "North Beach/Blue Ridge"}  # Neighborhood Name column
+
 # Columns used by Silver — warn (not fail) if any are absent from the CSV
 EXPECTED_NUMERIC_COLUMNS = {
     "Median Age",
@@ -227,6 +233,15 @@ def silver_transform_population(**context) -> dict:
     for doc in bronze_docs:
         neighborhood = (doc.get("neighborhood_name") or "").strip()
         if not neighborhood:
+            skipped_dq += 1
+            continue
+
+        # DQ: Skip administrative/unmappable areas — they have no SPD crime equivalent
+        # (Council Districts = political boundaries, not crime-reporting areas)
+        nbhd_type = (doc.get("Neighborhood Type") or "").strip().upper()
+        if nbhd_type in SKIP_SUBTYPES or neighborhood in SKIP_NEIGHBORHOODS:
+            log.info("[silver-pop] Skipping unmappable area: '%s' (type=%s)",
+                     neighborhood, nbhd_type)
             skipped_dq += 1
             continue
 
