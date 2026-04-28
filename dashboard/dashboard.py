@@ -428,44 +428,6 @@ else:
 st.divider()
 
 # ════════════════════════════════════════════════════════════
-# SECTION 3: Top Neighborhoods (Crime Rate & 911 Rate)
-# ════════════════════════════════════════════════════════════
-st.subheader("🏙️ Seattle Safety — Top Risk Neighborhoods")
-st.caption("ย่านที่มีอัตราอาชญากรรมสูงสุด 15 อันดับแรก")
-
-if not safety_profile.empty:
-    top_n2 = st.slider("จำนวน Neighborhoods", 5, 30, 15, key="topn2")
-    m1, m2 = st.columns(2)
-
-    with m1:
-        st.markdown("**🔴 Crime Rate per 10,000 Population**")
-        if "crime_rate_per_10k" in safety_profile.columns:
-            tc = (safety_profile.dropna(subset=["crime_rate_per_10k"])
-                  .nlargest(top_n2, "crime_rate_per_10k")
-                  [["neighborhood_name", "crime_rate_per_10k"]])
-            st.plotly_chart(
-                bar_chart(tc, "neighborhood_name", "crime_rate_per_10k",
-                          color="#e74c3c", horizontal=True),
-                use_container_width=True, key="top_crime_bar"
-            )
-
-    with m2:
-        st.markdown("**📞 911 Call Rate per 10,000 Population**")
-        if "calls_911_rate_per_10k" in safety_profile.columns:
-            tc2 = (safety_profile.dropna(subset=["calls_911_rate_per_10k"])
-                   .nlargest(top_n2, "calls_911_rate_per_10k")
-                   [["neighborhood_name", "calls_911_rate_per_10k"]])
-            st.plotly_chart(
-                bar_chart(tc2, "neighborhood_name", "calls_911_rate_per_10k",
-                          color="#3498db", horizontal=True),
-                use_container_width=True, key="top_911_bar"
-            )
-else:
-    st.info("ยังไม่มีข้อมูล agg_neighborhood_safety_profile — รัน spd_crime_pipeline ก่อน")
-
-st.divider()
-
-# ════════════════════════════════════════════════════════════
 # SECTION 4: Crime Trend Monthly (by Neighborhood)
 # ════════════════════════════════════════════════════════════
 st.subheader("📈 Crime Trend by Neighborhood & Category")
