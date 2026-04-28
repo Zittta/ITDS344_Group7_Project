@@ -1,0 +1,12 @@
+# Unified project dependencies
+# Used by: Airflow, Dashboard, and Streaming services
+pymongo==4.6.1
+requests==2.31.0
+streamlit==1.32.2
+plotly==5.18.0
+pandas==2.2.2
+kafka-python-ng==2.2.3
+
+streamlit==1.32.2
+plotly==5.18.0
+pandas==2.2.2
