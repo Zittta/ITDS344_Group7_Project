@@ -255,8 +255,6 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       SOCRATA_APP_TOKEN: ${SOCRATA_APP_TOKEN}
-    volumes:
-      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
     restart: always
 
   # ─── [STREAMING] Kafka Consumer — Kafka → MongoDB bronze ──────────────────────
