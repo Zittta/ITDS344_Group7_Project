@@ -42,6 +42,7 @@ from typing import Optional
 
 import requests
 from airflow import DAG
+from airflow.models.baseoperator import cross_downstream
 from airflow.operators.python import PythonOperator
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
@@ -1164,4 +1165,4 @@ with DAG(
     t_silver >> [t_dim_loc, t_dim_off, t_dim_nbhd] >> t_fact
     t_dim_nbhd >> t_reenrich_911
     t_fact >> [t_agg_cat, t_agg_pc, t_agg_trend]
-    [t_fact, t_reenrich_911] >> [t_agg_911pc, t_agg_profile]
+    cross_downstream([t_fact, t_reenrich_911], [t_agg_911pc, t_agg_profile])
