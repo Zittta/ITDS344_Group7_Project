@@ -50,12 +50,18 @@ TOPIC_CONFIG = {
         "unique_key":      "incident_number",
         "required_fields": ["incident_number", "datetime"],
         "source_name":     "seattle_911",
+        "timestamp_field": "datetime",
+        "lat_field":       "latitude",
+        "lon_field":       "longitude",
     },
     "bronze_crime_reports": {
         "collection":      "spd_crime",
         "unique_key":      "offense_id",
         "required_fields": ["offense_id", "report_date_time"],
         "source_name":     "spd_crime",
+        "timestamp_field": "report_date_time",
+        "lat_field":       "latitude",
+        "lon_field":       "longitude",
     },
 }
 
@@ -75,20 +81,51 @@ def _get_mongo_db():
     return client, db
 
 
+# ─── DQ helpers ───────────────────────────────────────────────────────────────
+
+def _try_parse_dt(val) -> bool:
+    """Return True if val is a recognisable ISO-8601 timestamp string."""
+    if not val:
+        return False
+    s = str(val).strip().rstrip("Z")
+    if len(s) > 19 and s[19] in ("+", "-"):
+        s = s[:19]
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _try_float(val):
+    """Parse val to float; return None on failure."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 # ─── Data Quality ─────────────────────────────────────────────────────────────
 
 def _data_quality_check(topic: str, records: list[dict]) -> list[dict]:
     """
-    DQ Rule 1: required fields must be non-empty — record dropped if any missing.
-    DQ Rule 2: in-batch dedup on unique_key — later duplicate dropped.
-    Returns only records that passed both checks.
+    DQ Rule 1 (Null)   : required fields must be non-empty — record dropped if any missing.
+    DQ Rule 2 (Dup)    : in-batch dedup on unique_key — later duplicate dropped.
+    DQ Rule 3 (Schema) : timestamp field must be parseable ISO-8601 — record dropped.
+    DQ Rule 4 (Range)  : lat/lon outside WGS84 bounds — logged as warning (not dropped at bronze).
+    Returns only records that passed Rules 1-3.
     """
     cfg        = TOPIC_CONFIG[topic]
     required   = cfg["required_fields"]
     unique_key = cfg["unique_key"]
+    ts_field   = cfg.get("timestamp_field")
+    lat_field  = cfg.get("lat_field")
+    lon_field  = cfg.get("lon_field")
     total      = len(records)
 
-    # DQ Rule 1: Missing required fields
+    # DQ Rule 1 (Null): Missing required fields
     missing_count = 0
     after_missing: list[dict] = []
     for rec in records:
@@ -100,7 +137,7 @@ def _data_quality_check(topic: str, records: list[dict]) -> list[dict]:
         else:
             after_missing.append(rec)
 
-    # DQ Rule 2: In-batch dedup
+    # DQ Rule 2 (Duplicate): In-batch dedup
     seen_keys: dict[str, dict] = {}
     dup_count = 0
     for rec in after_missing:
@@ -109,11 +146,43 @@ def _data_quality_check(topic: str, records: list[dict]) -> list[dict]:
             dup_count += 1
         else:
             seen_keys[key] = rec
-
     deduped = list(seen_keys.values())
-    log.info("[DQ][%s] total=%d | missing=%d | in-batch-dups=%d | passed=%d",
-             topic, total, missing_count, dup_count, len(deduped))
-    return deduped
+
+    # DQ Rule 3 (Schema): timestamp field must be parseable
+    schema_count = 0
+    after_schema: list[dict] = []
+    if ts_field:
+        for rec in deduped:
+            ts_val = rec.get(ts_field, "")
+            if not _try_parse_dt(ts_val):
+                schema_count += 1
+                log.warning("[DQ-SCHEMA][%s] Unparseable %s='%s' for key=%s — dropped",
+                            topic, ts_field, ts_val, rec.get(unique_key, "?"))
+            else:
+                after_schema.append(rec)
+    else:
+        after_schema = deduped
+
+    # DQ Rule 4 (Range): lat/lon WGS84 — warning only, not dropped at bronze layer
+    range_warn = 0
+    if lat_field and lon_field:
+        for rec in after_schema:
+            lat = _try_float(rec.get(lat_field))
+            lon = _try_float(rec.get(lon_field))
+            if lat is not None and not -90 <= lat <= 90:
+                range_warn += 1
+                log.warning("[DQ-RANGE][%s] lat=%.4f out of WGS84 range for key=%s",
+                            topic, lat, rec.get(unique_key, "?"))
+            if lon is not None and not -180 <= lon <= 180:
+                range_warn += 1
+                log.warning("[DQ-RANGE][%s] lon=%.4f out of WGS84 range for key=%s",
+                            topic, lon, rec.get(unique_key, "?"))
+
+    log.info(
+        "[DQ][%s] total=%d | missing=%d | in-batch-dups=%d | schema_err=%d | range_warn=%d | passed=%d",
+        topic, total, missing_count, dup_count, schema_count, range_warn, len(after_schema),
+    )
+    return after_schema
 
 
 # ─── Kafka helper ─────────────────────────────────────────────────────────────

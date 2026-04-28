@@ -46,6 +46,20 @@ CSV_PATH         = "/opt/airflow/data/raw_csv/seattle_neighborhoods_acs.csv"
 ACS_YEAR         = 2024
 REQUIRED_COLUMNS = {"Neighborhood Name", "Total Population"}
 
+# Columns used by Silver — warn (not fail) if any are absent from the CSV
+EXPECTED_NUMERIC_COLUMNS = {
+    "Median Age",
+    "Male",
+    "Female",
+    "Not Hispanic or Latino White alone",
+    "Not Hispanic or Latino Black or African American alone",
+    "Hispanic or Latino (of any race)",
+    "Per Capita Income",
+    "Families with income in the past 12 months below poverty level",
+    "Families for whom poverty status is determined",
+    "Total Housing Units",
+}
+
 
 # ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -88,6 +102,15 @@ def validate_csv(**context) -> dict:
         raise ValueError(
             f"CSV missing required columns: {missing_cols}\n"
             f"Available: {sorted(headers)}"
+        )
+
+    # DQ Rule 3 (Schema): warn if expected numeric columns used by Silver are absent
+    missing_numeric = EXPECTED_NUMERIC_COLUMNS - headers
+    if missing_numeric:
+        log.warning(
+            "[DQ-SCHEMA][validate-csv] %d expected numeric column(s) missing from CSV — "
+            "Silver will receive None for those fields: %s",
+            len(missing_numeric), sorted(missing_numeric),
         )
 
     log.info("CSV validation passed: %d rows, %d columns", len(rows), len(headers))
@@ -135,6 +158,13 @@ def bronze_load_population(**context) -> dict:
         except (ValueError, TypeError):
             log.warning("[DQ-POP] Non-numeric Total Population '%s' for '%s' — dropped",
                         raw_pop, neighborhood)
+            skipped_dq += 1
+            continue
+
+        # DQ Rule 5 (Range): population must be positive
+        if total_pop <= 0:
+            log.warning("[DQ-RANGE][bronze-pop] total_population=%d ≤ 0 for '%s' — dropped",
+                        total_pop, neighborhood)
             skipped_dq += 1
             continue
 
@@ -232,18 +262,35 @@ def silver_transform_population(**context) -> dict:
             else None
         )
 
+        # DQ Rule 4 (Range): percentage fields must be 0–100; clamp outliers to None
+        def _validated_pct(val: Optional[float], label: str) -> Optional[float]:
+            if val is None:
+                return None
+            if not 0.0 <= val <= 100.0:
+                log.warning("[DQ-RANGE][silver-pop] %s=%.2f out of 0-100 for '%s' — set to None",
+                            label, val, neighborhood)
+                return None
+            return val
+
+        # DQ Rule 5 (Range): median_age must be positive
+        median_age_val = _num("Median Age")
+        if median_age_val is not None and median_age_val <= 0:
+            log.warning("[DQ-RANGE][silver-pop] median_age=%.2f ≤ 0 for '%s' — set to None",
+                        median_age_val, neighborhood)
+            median_age_val = None
+
         silver_doc = {
             "neighborhood_name":       neighborhood,
             "acs_year":                ACS_YEAR,
             "total_population":        int(total_pop),
-            "median_age":              _num("Median Age"),
-            "male_pct":                _pct("Male"),
-            "female_pct":              _pct("Female"),
-            "white_pct":               _pct("Not Hispanic or Latino White alone"),
-            "black_pct":               _pct("Not Hispanic or Latino Black or African American alone"),
-            "hispanic_pct":            _pct("Hispanic or Latino (of any race)"),
+            "median_age":              median_age_val,
+            "male_pct":                _validated_pct(_pct("Male"), "male_pct"),
+            "female_pct":              _validated_pct(_pct("Female"), "female_pct"),
+            "white_pct":               _validated_pct(_pct("Not Hispanic or Latino White alone"), "white_pct"),
+            "black_pct":               _validated_pct(_pct("Not Hispanic or Latino Black or African American alone"), "black_pct"),
+            "hispanic_pct":            _validated_pct(_pct("Hispanic or Latino (of any race)"), "hispanic_pct"),
             "median_household_income": _num("Per Capita Income"),
-            "poverty_pct":             poverty_pct_val,
+            "poverty_pct":             _validated_pct(poverty_pct_val, "poverty_pct"),
             "total_housing_units":     _num("Total Housing Units"),
             "_source":                 "seattle_population_csv",
             "_bronze_doc_id":          str(doc.get("_id", "")),

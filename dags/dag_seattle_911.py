@@ -156,81 +156,7 @@ def _set_gold_wm(db_gold, source: str, ts: datetime) -> None:
     )
 
 
-# ─── Task 1: Bronze Ingestion ─────────────────────────────────────────────────
-
-def bronze_ingest_911(**context) -> dict:
-    """
-    Consumes new 911 call records from Kafka topic 'bronze_911_calls'.
-    DQ Rule 1: required fields (incident_number, datetime) must be non-empty.
-    DQ Rule 2: timestamp field must be present and parseable.
-    Idempotency: upsert on incident_number — re-runs are safe.
-    """
-    from kafka import KafkaConsumer
-    import json
-
-    cfg    = SOURCE_CFG
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30_000)
-    db     = client[BRONZE_DB]
-    db["seattle_911"].create_index(cfg["unique_key"], background=True)
-
-    consumer = KafkaConsumer(
-        "bronze_911_calls",
-        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP", "kafka:9092"),
-        group_id="bronze_ingest_911",
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-    )
-
-    buffer = []
-    total_upserted = 0
-    skipped_dq = 0
-    ts_field = cfg["timestamp_field"]
-    for message in consumer:
-        rec = message.value
-        # DQ check
-        if any(not rec.get(f) for f in cfg["required_fields"]):
-            skipped_dq += 1
-            continue
-        if not rec.get(ts_field):
-            skipped_dq += 1
-            continue
-        buffer.append(rec)
-        if len(buffer) >= UPSERT_CHUNK:
-            now = datetime.now(timezone.utc)
-            ops = [
-                UpdateOne(
-                    {cfg["unique_key"]: r[cfg["unique_key"]]},
-                    {
-                        "$setOnInsert": {**r, "_source": "seattle_911", "_ingested_at": now},
-                        "$set": {"_last_seen_at": now},
-                    },
-                    upsert=True,
-                )
-                for r in buffer
-            ]
-            total_upserted += _bulk_upsert(db["seattle_911"], ops, "bronze-911")
-            buffer = []
-    # Flush remaining
-    if buffer:
-        now = datetime.now(timezone.utc)
-        ops = [
-            UpdateOne(
-                {cfg["unique_key"]: r[cfg["unique_key"]]},
-                {
-                    "$setOnInsert": {**r, "_source": "seattle_911", "_ingested_at": now},
-                    "$set": {"_last_seen_at": now},
-                },
-                upsert=True,
-            )
-            for r in buffer
-        ]
-        total_upserted += _bulk_upsert(db["seattle_911"], ops, "bronze-911")
-    client.close()
-    return {"upserted": total_upserted, "skipped_dq": skipped_dq}
-
-
-# ─── Task 2: Silver Transform ─────────────────────────────────────────────────
+# ─── Task 1: Silver Transform ─────────────────────────────────────────────────
 
 def silver_transform_911(**context) -> dict:
     """
@@ -266,6 +192,13 @@ def silver_transform_911(**context) -> dict:
 
         call_dt = _parse_dt(doc.get("datetime", ""))
         if call_dt is None:
+            skipped_dq += 1
+            continue
+
+        # DQ Rule 3 (Range): datetime must not be in the future (allow 1-day buffer for timezone drift)
+        if call_dt > now + timedelta(days=1):
+            log.warning("[DQ-RANGE][silver-911] Future datetime=%s for incident=%s — dropped",
+                        call_dt, doc.get("incident_number"))
             skipped_dq += 1
             continue
 

@@ -4,6 +4,7 @@
 # Airflow logs and data (large files, not source code)
 logs/
 data/
+!data/raw_csv/seattle_neighborhoods_acs.csv
 
 # Python
 __pycache__/
